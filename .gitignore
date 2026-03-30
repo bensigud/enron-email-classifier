@@ -13,7 +13,9 @@ build/
 venv/
 .venv/
 env/
-.env/
+
+# Environment variables — NEVER commit this, it contains secret API keys
+.env
 
 # Jupyter
 .ipynb_checkpoints/
