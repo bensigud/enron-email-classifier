@@ -1,33 +1,23 @@
 import re
+import ast
 import email
-import signal
 import pandas as pd
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 
 
-def _timeout_handler(signum, frame):
-    raise TimeoutError("File parse timed out")
-
-
 def _parse_file(file_path: Path) -> dict:
     """Parse a single email file. Runs in parallel across CPU cores."""
     try:
-        # Kill any file that takes more than 5 seconds (handles corrupted files)
-        signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(5)
-
         raw = file_path.read_text(errors="ignore")
         msg = email.message_from_string(raw)
 
         sender = msg.get("From", "").strip()
         if not sender:
-            signal.alarm(0)
             return None
 
         body = _extract_body(msg)
         if not body:
-            signal.alarm(0)
             return None
 
         result = {
@@ -38,10 +28,8 @@ def _parse_file(file_path: Path) -> dict:
             "subject":    msg.get("Subject", "").strip(),
             "body":       clean_text(body),
         }
-        signal.alarm(0)
         return result
     except Exception:
-        signal.alarm(0)
         return None
 
 
@@ -119,6 +107,92 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def get_executive_addresses(data_path: str) -> set:
+    """
+    Get the set of executive email addresses from the maildir folder names.
+    Each folder in maildir/ is one executive's mailbox (e.g. 'lay-k', 'skilling-j').
+    We convert folder names to the most common email pattern: first.last@enron.com
+    """
+    data_path = Path(data_path)
+    if not data_path.exists():
+        return set()
+
+    folders = [f.name for f in data_path.iterdir() if f.is_dir()]
+
+    # Build possible email patterns from folder names
+    # Folder format is usually "lastname-f" (e.g. "lay-k", "skilling-j")
+    addresses = set()
+    for folder in folders:
+        parts = folder.split("-")
+        if len(parts) >= 2:
+            lastname = parts[0]
+            firstinit = parts[1]
+            # Common Enron patterns
+            addresses.add(f"{firstinit}.{lastname}@enron.com")
+            addresses.add(f"{firstinit}{lastname}@enron.com")
+            addresses.add(f"{lastname}.{firstinit}@enron.com")
+            addresses.add(f"{lastname}{firstinit}@enron.com")
+            addresses.add(f"{firstinit}.{lastname}@enron.com".lower())
+
+    return addresses
+
+
+def filter_executives_only(df: pd.DataFrame, data_path: str) -> pd.DataFrame:
+    """
+    Filter the DataFrame to only keep emails where BOTH the sender
+    and at least one recipient are executives (have a mailbox in maildir).
+
+    We identify executive email addresses by looking at emails in each
+    person's "sent_items" or "sent" folder — the sender of those emails
+    is that executive's actual email address.
+    """
+    data_path = Path(data_path)
+
+    # Step 1: Find each executive's real email address from their sent folders
+    exec_addresses = set()
+    for folder in data_path.iterdir():
+        if not folder.is_dir():
+            continue
+        # Look for sent mail folders — these contain emails FROM this executive
+        sent_folders = []
+        for subfolder in folder.iterdir():
+            if subfolder.is_dir() and subfolder.name in ("sent", "sent_items", "_sent_mail"):
+                sent_folders.append(subfolder)
+
+        # Get the sender address from emails in their sent folder
+        for sent_folder in sent_folders:
+            sent_files = [f for f in sent_folder.rglob("*") if f.is_file()]
+            for sent_file in sent_files[:5]:  # only need a few to find the address
+                try:
+                    raw = sent_file.read_text(errors="ignore")
+                    msg = email.message_from_string(raw)
+                    sender = msg.get("From", "").strip()
+                    if sender:
+                        addr = _clean_email(sender)
+                        if addr and "@" in addr:
+                            exec_addresses.add(addr)
+                            break
+                except Exception:
+                    continue
+
+    # Also include addresses derived from folder names as fallback
+    exec_addresses.update(get_executive_addresses(str(data_path)))
+
+    print(f"  Found {len(exec_addresses):,} executive email addresses")
+
+    # Filter: sender must be an executive
+    df = df[df["sender"].isin(exec_addresses)].copy()
+
+    # Filter: at least one recipient must be an executive
+    df["recipients"] = df["recipients"].apply(
+        lambda recips: [r for r in recips if r in exec_addresses]
+    )
+    df = df[df["recipients"].apply(len) > 0]
+
+    print(f"  After filtering: {len(df):,} emails between executives")
+    return df
+
+
 def save_processed(df: pd.DataFrame, output_path: str):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,6 +203,6 @@ def save_processed(df: pd.DataFrame, output_path: str):
 def load_processed(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-    df["recipients"] = df["recipients"].apply(eval)
+    df["recipients"] = df["recipients"].apply(ast.literal_eval)
     print(f"Loaded {len(df):,} emails from {path}")
     return df

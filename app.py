@@ -7,15 +7,15 @@ Launch with:  streamlit run app.py
 
 import json
 import pandas as pd
+import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import streamlit as st
 from pathlib import Path
 from src.claude_client import ask_question
 
 # ----------------------------------------------------------------
-# Page config — sets the browser tab title and layout
+# Page config
 # ----------------------------------------------------------------
 st.set_page_config(
     page_title="The Social World of Enron",
@@ -26,23 +26,20 @@ st.set_page_config(
 RESULTS_PATH = Path("data/results")
 
 # ----------------------------------------------------------------
-# Colour maps — consistent colours across the whole app
+# Colour maps
 # ----------------------------------------------------------------
 PERSON_COLORS = {
-    "Hub":          "#e74c3c",   # red
-    "Gatekeeper":   "#e67e22",   # orange
-    "Inner Circle": "#9b59b6",   # purple
-    "Follower":     "#3498db",   # blue
-    "Isolated":     "#95a5a6",   # grey
+    "Hub":          "#e74c3c",
+    "Gatekeeper":   "#e67e22",
+    "Inner Circle": "#9b59b6",
+    "Follower":     "#3498db",
+    "Isolated":     "#95a5a6",
 }
 
-RELATIONSHIP_COLORS = {
-    "Professional": "#3498db",   # blue
-    "Friendly":     "#2ecc71",   # green
-    "Hostile":      "#e74c3c",   # red
-    "Mentorship":   "#f39c12",   # yellow
-    "Romantic":     "#e91e8c",   # pink
-}
+CLUSTER_COLORS = [
+    "#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6",
+    "#e91e8c", "#1abc9c", "#95a5a6",
+]
 
 
 # ----------------------------------------------------------------
@@ -57,19 +54,46 @@ def load_person_data():
 
 
 @st.cache_data
-def load_pairs_data():
-    path = RESULTS_PATH / "sentiment_pairs.csv"
+def load_relationship_data():
+    path = RESULTS_PATH / "relationship_pairs.csv"
     if not path.exists():
         return None
     return pd.read_csv(path)
 
 
 @st.cache_data
-def load_romance_data():
-    path = RESULTS_PATH / "romance_pairs.csv"
+def load_cluster_profiles():
+    path = RESULTS_PATH / "cluster_profiles.csv"
     if not path.exists():
         return None
     return pd.read_csv(path)
+
+
+@st.cache_data
+def load_cluster_names():
+    path = RESULTS_PATH / "cluster_names.json"
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        return {int(k): v for k, v in json.load(f).items()}
+
+
+@st.cache_data
+def load_clustering_meta():
+    path = RESULTS_PATH / "clustering_meta.json"
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+@st.cache_data
+def load_model_comparison():
+    path = RESULTS_PATH / "model_comparison.json"
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        return json.load(f)
 
 
 @st.cache_data
@@ -81,18 +105,58 @@ def load_communities():
         return json.load(f)
 
 
-def build_context_for_claude(person_df, pairs_df, romance_df):
-    """
-    Build a text summary of our findings to pass to Claude
-    as context when answering questions.
-    """
+@st.cache_data
+def load_emails():
+    path = Path("data/processed/emails.csv")
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+    return df
+
+
+def show_email_viewer(emails_df, person_a, person_b):
+    """Show emails between two people in an expandable viewer."""
+    if emails_df is None:
+        st.info("Email data not loaded.")
+        return
+
+    mask = (
+        (emails_df["sender"].eq(person_a) &
+         emails_df["recipients"].str.contains(person_b, na=False, regex=False)) |
+        (emails_df["sender"].eq(person_b) &
+         emails_df["recipients"].str.contains(person_a, na=False, regex=False))
+    )
+    matched = emails_df[mask].sort_values("date", ascending=False)
+
+    if len(matched) == 0:
+        st.info(f"No emails found between {person_a} and {person_b}.")
+        return
+
+    st.markdown(f"**Found {len(matched)} emails between these two**")
+
+    for i, (_, row) in enumerate(matched.head(20).iterrows()):
+        date_str = row["date"].strftime("%Y-%m-%d %H:%M") if pd.notna(row["date"]) else "Unknown"
+        subject = row["subject"] if isinstance(row["subject"], str) else "(no subject)"
+        with st.expander(f"📧 {date_str} — {subject}"):
+            st.markdown(f"**From:** {row['sender']}")
+            st.markdown(f"**To:** {row['recipients']}")
+            st.markdown(f"**Date:** {date_str}")
+            st.markdown(f"**Subject:** {subject}")
+            st.markdown("---")
+            body = row["body"] if isinstance(row["body"], str) else "(empty)"
+            st.text(body[:2000])
+
+    if len(matched) > 20:
+        st.caption(f"Showing 20 of {len(matched)} emails.")
+
+
+def build_context_for_claude(person_df, pairs_df, cluster_profiles):
+    """Build a text summary of findings to pass to Claude as context."""
     if person_df is None:
         return "No analysis results available yet. Run main.py first."
 
     top_hubs = person_df[person_df["person_class"] == "Hub"].nlargest(5, "total_degree")
-    top_hostile = pairs_df[pairs_df["relationship_class"] == "Hostile"].nsmallest(3, "avg_sentiment") if pairs_df is not None else pd.DataFrame()
-    top_romantic = romance_df.head(5) if romance_df is not None else pd.DataFrame()
-
     class_dist = person_df["person_class"].value_counts().to_dict()
 
     context = f"""
@@ -103,16 +167,38 @@ Person class distribution: {class_dist}
 
 TOP HUBS (most connected people):
 {top_hubs[['person','total_degree','betweenness']].to_string(index=False)}
-
-RELATIONSHIP DISTRIBUTION:
-{pairs_df['relationship_class'].value_counts().to_string() if pairs_df is not None else 'N/A'}
-
-MOST HOSTILE PAIRS:
-{top_hostile[['sender','recipient','avg_sentiment']].to_string(index=False) if not top_hostile.empty else 'None found'}
-
-TOP ROMANTIC/PERSONAL PAIRS:
-{top_romantic[['person_a','person_b','avg_romance_score']].to_string(index=False) if not top_romantic.empty else 'None found'}
 """
+
+    if pairs_df is not None:
+        context += f"""
+RELATIONSHIP PAIRS ANALYSED: {len(pairs_df)}
+Number of relationship clusters: {pairs_df['cluster'].nunique()}
+
+CLUSTER DISTRIBUTION:
+{pairs_df['cluster'].value_counts().to_string()}
+"""
+
+    if cluster_profiles is not None:
+        context += f"""
+CLUSTER PROFILES (average features per cluster):
+{cluster_profiles.to_string(index=False)}
+"""
+
+    # Most personal pairs
+    if pairs_df is not None:
+        top_personal = pairs_df.nlargest(5, "avg_personal_score")
+        context += f"""
+MOST PERSONAL PAIRS:
+{top_personal[['person_a','person_b','avg_personal_score','avg_sentiment']].to_string(index=False)}
+"""
+
+        # Most negative pairs
+        most_negative = pairs_df.nsmallest(5, "avg_sentiment")
+        context += f"""
+MOST NEGATIVE SENTIMENT PAIRS:
+{most_negative[['person_a','person_b','avg_sentiment','avg_personal_score']].to_string(index=False)}
+"""
+
     return context
 
 
@@ -128,20 +214,22 @@ page = st.sidebar.radio(
     ["🏠 Overview",
      "🕸️ Social Network",
      "👤 Person Profile",
-     "❤️‍🔥 Friends & Enemies",
-     "💌 Office Romance",
+     "🔗 Relationships",
      "🤖 Ask the Data"],
 )
 
 # ----------------------------------------------------------------
 # Load data
 # ----------------------------------------------------------------
-person_df  = load_person_data()
-pairs_df   = load_pairs_data()
-romance_df = load_romance_data()
-communities = load_communities()
+person_df = load_person_data()
+pairs_df = load_relationship_data()
+cluster_profiles = load_cluster_profiles()
+clustering_meta = load_clustering_meta()
+model_comparison = load_model_comparison()
+cluster_names = load_cluster_names()
 
 data_ready = person_df is not None
+
 
 if not data_ready:
     st.warning("⚠️ No results found. Please run `python main.py` first to generate the analysis.")
@@ -158,15 +246,15 @@ if page == "🏠 Overview":
     scandals in history. The investigation released **~500,000 internal emails**
     — giving us a rare window into the private world of a company falling apart.
 
-    This app explores those emails through **4 machine learning analyses**:
+    This app explores those emails through a **two-stage ML pipeline**:
     """)
 
     col1, col2 = st.columns(2)
     with col1:
-        st.info("**🕸️ Social Network**\nWho emailed who? Who were the key players?")
-        st.success("**❤️‍🔥 Friends & Enemies**\nSentiment analysis between every pair of people")
+        st.info("**🕸️ Network Analysis**\nWho emailed who? Who were the key players?")
+        st.success("**📊 Stage 1: Email Scoring**\nBinary classifier + VADER sentiment on every email")
     with col2:
-        st.warning("**💌 Office Romance**\nPersonal and romantic emails hiding in the data")
+        st.warning("**🔗 Stage 2: Relationship Clustering**\nUnsupervised clustering discovers relationship types")
         st.error("**🤖 Ask the Data**\nChat with Claude about the findings")
 
     if data_ready:
@@ -176,7 +264,21 @@ if page == "🏠 Overview":
         col1.metric("People", f"{len(person_df):,}")
         col2.metric("Hubs", f"{(person_df['person_class']=='Hub').sum()}")
         col3.metric("Pairs Analysed", f"{len(pairs_df):,}" if pairs_df is not None else "—")
-        col4.metric("Romantic Pairs", f"{len(romance_df):,}" if romance_df is not None else "—")
+        col4.metric("Clusters Found",
+                     f"{pairs_df['cluster'].nunique()}" if pairs_df is not None else "—")
+
+        # Show model comparison if available
+        if model_comparison:
+            st.markdown("---")
+            st.markdown("### Stage 1: Model Comparison")
+            comp_img = RESULTS_PATH / "model_comparison.png"
+            if comp_img.exists():
+                st.image(str(comp_img), use_container_width=True)
+
+            cm_img = RESULTS_PATH / "confusion_matrix.png"
+            if cm_img.exists():
+                st.markdown("### Confusion Matrix (Best Model)")
+                st.image(str(cm_img), use_container_width=True)
 
 
 # ================================================================
@@ -186,7 +288,6 @@ elif page == "🕸️ Social Network":
     st.title("🕸️ The Social Network")
     st.markdown("Each dot is a person. Each line is an email connection. Size = how connected they are.")
 
-    # Show the pre-generated network plot
     plot_path = RESULTS_PATH / "network_plot.png"
     if plot_path.exists():
         st.image(str(plot_path), use_container_width=True)
@@ -251,17 +352,28 @@ elif page == "👤 Person Profile":
             st.markdown("---")
             st.markdown("### Relationships")
             person_pairs = pairs_df[
-                (pairs_df["sender"] == selected) | (pairs_df["recipient"] == selected)
+                (pairs_df["person_a"] == selected) | (pairs_df["person_b"] == selected)
             ].copy()
 
             if len(person_pairs) > 0:
                 person_pairs["other_person"] = person_pairs.apply(
-                    lambda r: r["recipient"] if r["sender"] == selected else r["sender"],
+                    lambda r: r["person_b"] if r["person_a"] == selected else r["person_a"],
                     axis=1
                 )
-                display = person_pairs[["other_person", "relationship_class",
-                                        "avg_sentiment", "email_count"]].head(20)
-                display.columns = ["Connected To", "Relationship", "Sentiment", "Emails"]
+                # Use relationship_type if available, fall back to cluster number
+                if "relationship_type" in person_pairs.columns and cluster_names:
+                    type_col = "relationship_type"
+                else:
+                    person_pairs["relationship_type"] = person_pairs["cluster"].apply(
+                        lambda c: cluster_names.get(int(c), {}).get("name", f"Cluster {c}")
+                    )
+                    type_col = "relationship_type"
+                display = person_pairs[[
+                    "other_person", type_col, "avg_personal_score",
+                    "avg_sentiment", "email_count"
+                ]].head(20)
+                display.columns = ["Connected To", "Relationship", "Personal Score",
+                                   "Sentiment", "Emails"]
                 st.dataframe(display.reset_index(drop=True), use_container_width=True)
             else:
                 st.info("No pair data found for this person.")
@@ -270,100 +382,131 @@ elif page == "👤 Person Profile":
 
 
 # ================================================================
-# PAGE 4 — Friends & Enemies
+# PAGE 4 — Relationships
 # ================================================================
-elif page == "❤️‍🔥 Friends & Enemies":
-    st.title("❤️‍🔥 Friends & Enemies")
-    st.markdown("Sentiment analysis of email tone between every pair of people.")
+elif page == "🔗 Relationships":
+    st.title("🔗 Relationships")
+    st.markdown("Relationship types discovered by unsupervised clustering of pair features.")
 
     if data_ready and pairs_df is not None:
-        plot_path = RESULTS_PATH / "relationship_distribution.png"
-        if plot_path.exists():
-            st.image(str(plot_path), use_container_width=True)
 
+        # Clustering results overview
+        st.markdown("### Clustering Results")
+
+        if clustering_meta:
+            method = clustering_meta.get("best_method", "unknown")
+            score = clustering_meta.get("best_score", 0)
+            st.markdown(f"**Best method:** {method.upper()} — "
+                        f"**Silhouette score:** {score:.3f}")
+
+        sil_img = RESULTS_PATH / "silhouette_scores.png"
+        if sil_img.exists():
+            st.image(str(sil_img), use_container_width=True)
+
+        # Cluster distribution
         st.markdown("---")
-        col1, col2 = st.columns(2)
+        st.markdown("### Cluster Distribution")
+        dist_img = RESULTS_PATH / "cluster_distribution.png"
+        if dist_img.exists():
+            st.image(str(dist_img), use_container_width=True)
 
-        with col1:
-            st.markdown("### 😡 Most Hostile Pairs")
-            hostile = (pairs_df[pairs_df["relationship_class"] == "Hostile"]
-                       .nsmallest(10, "avg_sentiment")
-                       [["sender", "recipient", "avg_sentiment"]])
-            hostile.columns = ["Person A", "Person B", "Sentiment"]
-            hostile["Person A"] = hostile["Person A"].str.split("@").str[0]
-            hostile["Person B"] = hostile["Person B"].str.split("@").str[0]
-            st.dataframe(hostile.reset_index(drop=True), use_container_width=True)
-
-        with col2:
-            st.markdown("### 😊 Most Friendly Pairs")
-            friendly = (pairs_df[pairs_df["relationship_class"] == "Friendly"]
-                        .nlargest(10, "avg_sentiment")
-                        [["sender", "recipient", "avg_sentiment"]])
-            friendly.columns = ["Person A", "Person B", "Sentiment"]
-            friendly["Person A"] = friendly["Person A"].str.split("@").str[0]
-            friendly["Person B"] = friendly["Person B"].str.split("@").str[0]
-            st.dataframe(friendly.reset_index(drop=True), use_container_width=True)
-
+        # Cluster profiles (heatmap)
         st.markdown("---")
-        st.markdown("### Look up a specific pair")
-        people = sorted(set(pairs_df["sender"].tolist() + pairs_df["recipient"].tolist()))
+        st.markdown("### Cluster Feature Profiles")
+        st.markdown("*What makes each cluster distinct — average feature values per cluster*")
+        heatmap_img = RESULTS_PATH / "cluster_heatmap.png"
+        if heatmap_img.exists():
+            st.image(str(heatmap_img), use_container_width=True)
+
+        if cluster_profiles is not None:
+            st.dataframe(cluster_profiles, use_container_width=True)
+
+        # Cluster names summary
+        if cluster_names:
+            st.markdown("---")
+            st.markdown("### Relationship Types Discovered")
+            for cid in sorted(cluster_names.keys()):
+                info = cluster_names[cid]
+                count = (pairs_df["cluster"] == cid).sum()
+                color = CLUSTER_COLORS[cid % len(CLUSTER_COLORS)]
+                st.markdown(
+                    f"<div style='background:{color};padding:10px;border-radius:8px;"
+                    f"color:white;margin:6px 0'>"
+                    f"<b>{info['name']}</b> ({count} pairs) — "
+                    f"{info.get('description', '')}</div>",
+                    unsafe_allow_html=True
+                )
+
+        # Filter by cluster
+        st.markdown("---")
+        st.markdown("### Explore by Relationship Type")
+        clusters = sorted(pairs_df["cluster"].unique())
+        cluster_labels = {
+            c: cluster_names.get(int(c), {}).get("name", f"Cluster {c}")
+            for c in clusters
+        }
+        selected_label = st.selectbox(
+            "Select a relationship type",
+            clusters,
+            format_func=lambda c: f"{cluster_labels[c]} ({(pairs_df['cluster']==c).sum()} pairs)"
+        )
+
+        cluster_pairs = pairs_df[pairs_df["cluster"] == selected_label].copy()
+        cluster_pairs["Person A"] = cluster_pairs["person_a"].str.split("@").str[0]
+        cluster_pairs["Person B"] = cluster_pairs["person_b"].str.split("@").str[0]
+
+        display_cols = ["Person A", "Person B", "avg_personal_score",
+                        "avg_sentiment", "email_count", "personal_imbalance"]
+        st.dataframe(
+            cluster_pairs[display_cols]
+            .sort_values("avg_personal_score", ascending=False)
+            .head(30)
+            .reset_index(drop=True),
+            use_container_width=True
+        )
+
+        # Look up a specific pair
+        st.markdown("---")
+        st.markdown("### Look Up a Specific Pair")
+        all_people = sorted(set(
+            pairs_df["person_a"].tolist() + pairs_df["person_b"].tolist()
+        ))
         col1, col2 = st.columns(2)
-        person_a = col1.selectbox("Person A", people, key="pa")
-        person_b = col2.selectbox("Person B", people, key="pb", index=1)
+        person_a = col1.selectbox("Person A", all_people, key="pa")
+        person_b = col2.selectbox("Person B", all_people, key="pb", index=1)
 
         match = pairs_df[
-            ((pairs_df["sender"] == person_a) & (pairs_df["recipient"] == person_b)) |
-            ((pairs_df["sender"] == person_b) & (pairs_df["recipient"] == person_a))
+            ((pairs_df["person_a"] == person_a) & (pairs_df["person_b"] == person_b)) |
+            ((pairs_df["person_a"] == person_b) & (pairs_df["person_b"] == person_a))
         ]
 
         if len(match) > 0:
             row = match.iloc[0]
-            cls = row["relationship_class"]
-            color = RELATIONSHIP_COLORS.get(cls, "#aaa")
+            cluster_id = int(row["cluster"])
+            cluster_label = cluster_names.get(cluster_id, {}).get("name", f"Cluster {cluster_id}")
+            color = CLUSTER_COLORS[cluster_id % len(CLUSTER_COLORS)]
             st.markdown(
                 f"<div style='background:{color};padding:12px;border-radius:8px;"
                 f"color:white;text-align:center;font-size:1.3em'>"
-                f"<b>{cls}</b> relationship — sentiment score: {row['avg_sentiment']:.3f}"
+                f"<b>{cluster_label}</b> — "
+                f"Personal: {row['avg_personal_score']:.3f} | "
+                f"Sentiment: {row['avg_sentiment']:.3f} | "
+                f"Emails: {int(row['email_count'])}"
                 f"</div>",
                 unsafe_allow_html=True
             )
+            st.markdown("---")
+            st.markdown("### 📨 Their Emails")
+            show_email_viewer(load_emails(), person_a, person_b)
         else:
-            st.info("No direct email relationship found between these two people.")
+            st.info("No direct relationship found between these two people.")
+
     else:
         st.info("Run main.py to generate results.")
 
 
 # ================================================================
-# PAGE 5 — Office Romance
-# ================================================================
-elif page == "💌 Office Romance":
-    st.title("💌 Office Romance")
-    st.markdown("Personal and romantic emails detected by our machine learning classifier.")
-
-    if data_ready and romance_df is not None:
-        plot_path = RESULTS_PATH / "romance_pairs.png"
-        if plot_path.exists():
-            st.image(str(plot_path), use_container_width=True)
-
-        st.markdown("---")
-        st.markdown("### Flagged Pairs")
-        st.markdown("*Pairs with consistently personal or romantic email patterns*")
-
-        display = romance_df.copy()
-        display["Person A"] = display["person_a"].str.split("@").str[0]
-        display["Person B"] = display["person_b"].str.split("@").str[0]
-        display["Romance Score"] = display["avg_romance_score"].round(3)
-        display["Emails"] = display["email_count"]
-        st.dataframe(
-            display[["Person A", "Person B", "Romance Score", "Emails"]].reset_index(drop=True),
-            use_container_width=True
-        )
-    else:
-        st.info("Run main.py to generate results.")
-
-
-# ================================================================
-# PAGE 6 — Ask the Data (Claude Chat)
+# PAGE 5 — Ask the Data (Claude Chat)
 # ================================================================
 elif page == "🤖 Ask the Data":
     st.title("🤖 Ask the Data")
@@ -372,17 +515,15 @@ elif page == "🤖 Ask the Data":
         "Claude answers based on what our data actually shows."
     )
 
-    # Build the context string from our results
-    context = build_context_for_claude(person_df, pairs_df, romance_df)
+    context = build_context_for_claude(person_df, pairs_df, cluster_profiles)
 
-    # Example questions to help the user get started
     st.markdown("**Example questions:**")
     examples = [
         "Who was the most connected person at Enron?",
-        "Were there any romantic relationships involving senior executives?",
-        "Which employees showed the most hostile communication?",
+        "How many relationship types did the clustering find?",
+        "Which pairs had the most personal communication?",
         "What does the data tell us about Ken Lay's social network?",
-        "Which community had the most internal emails?",
+        "Which cluster seems to represent hostile relationships?",
     ]
     for ex in examples:
         if st.button(ex):

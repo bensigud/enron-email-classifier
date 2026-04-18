@@ -14,49 +14,49 @@ client = anthropic.Anthropic()
 # The Claude model we use — Sonnet is fast and smart, good balance for this project
 MODEL = "claude-sonnet-4-6"
 
-# How many emails we send to Claude for labeling (keeps cost reasonable)
-LABEL_SAMPLE_SIZE = 50  # small for testing — increase to 500 for full run
+# How many emails we send to Claude for labeling
+LABEL_SAMPLE_SIZE = 500
 
 
 def label_email(email_text: str) -> str:
     """
     Ask Claude to classify a single email as:
-      - "professional" : normal work email
-      - "personal"     : friendly/casual but not romantic
-      - "romantic"     : intimate, flirtatious or clearly personal/romantic
+      - "professional" : normal work email, business topics
+      - "personal"     : friendly, casual, social, intimate, or romantic
 
-    We give Claude a very clear prompt so it gives consistent answers.
-    We only look at the first 300 characters to keep it fast and cheap.
+    We use binary classification (2 classes instead of 3+) because:
+    - Binary classifiers are more reliable with limited training data
+    - We use the probability score as a spectrum rather than hard labels
+    - The downstream clustering handles finer relationship types
+
+    We send the first 800 characters to give Claude enough context
+    without excessive cost.
     """
-    # Trim the email so we don't send too much text to the API
     if not isinstance(email_text, str) or not email_text.strip():
         return "professional"
 
-    snippet = email_text[:300].strip()
+    snippet = email_text[:800].strip()
 
     prompt = f"""You are analyzing internal corporate emails from Enron Corporation.
 
-Classify this email into exactly ONE of these three categories:
-- professional: normal work communication, business topics
-- personal: friendly, casual, or social but not romantic
-- romantic: intimate, flirtatious, emotionally close, or clearly personal/romantic
+Classify this email into exactly ONE of these two categories:
+- professional: normal work communication, business topics, formal requests, reports, scheduling
+- personal: friendly, casual, social, emotional, intimate, romantic, or any non-work content
 
 Email text:
 \"\"\"{snippet}\"\"\"
 
-Reply with only one word: professional, personal, or romantic."""
+Reply with only one word: professional or personal."""
 
     response = client.messages.create(
         model=MODEL,
-        max_tokens=10,        # We only need one word back
+        max_tokens=10,
         messages=[{"role": "user", "content": prompt}]
     )
 
-    # Pull out the text and clean it up
     label = response.content[0].text.strip().lower()
 
-    # Make sure we always return a valid label
-    if label not in ("professional", "personal", "romantic"):
+    if label not in ("professional", "personal"):
         return "professional"
 
     return label
@@ -68,13 +68,11 @@ def label_email_batch(df: pd.DataFrame,
     Take a random sample of emails, send each one to Claude to label,
     and return a DataFrame with the labels added.
 
-    This is Step 1 of the romance detection pipeline.
-    We only label a sample (500 emails) to keep costs low —
-    then we train a classifier to predict the rest automatically.
+    This is Step 1 of Stage 1 — we label a sample to use as training data
+    for the binary classifier.
     """
     print(f"Sending {sample_size} emails to Claude for labeling...")
 
-    # Take a random sample
     sample = df.sample(n=min(sample_size, len(df)), random_state=42).copy()
 
     labels = []
@@ -98,15 +96,7 @@ def ask_question(question: str, context: str) -> str:
     Used by the chat assistant in the Streamlit UI.
 
     We pass in the analysis results as 'context' so Claude
-    can answer based on what the data actually shows —
-    not just general knowledge about Enron.
-
-    Args:
-        question: what the user typed in the chat box
-        context:  a summary of our analysis results (passed from the UI)
-
-    Returns:
-        Claude's answer as a plain text string
+    can answer based on what the data actually shows.
     """
     prompt = f"""You are an AI assistant helping explore the results of a
 machine learning analysis of the Enron email dataset.

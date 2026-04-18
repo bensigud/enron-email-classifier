@@ -1,8 +1,8 @@
 """
-The Social World of Enron — Main Analysis Runner
+The Social World of Enron — Main Pipeline Runner
 RAF620M — University of Iceland
 
-Run this file to execute all 4 analyses:
+Run this file to execute the full pipeline:
   python main.py
 
 Results are saved to data/results/ and can then be
@@ -12,10 +12,11 @@ explored in the Streamlit UI:
 
 import sys
 from pathlib import Path
-from src.loader import load_emails, load_processed, save_processed
+from src.loader import load_emails, load_processed, save_processed, filter_executives_only
 from src.network import run_network_analysis
-from src.sentiment import run_sentiment_analysis
-from src.romance import run_romance_analysis
+from src.stage1 import run_stage1
+from src.stage2 import run_stage2
+from src.stage3 import run_stage3
 
 # Paths
 RAW_DATA_PATH = "data/raw/maildir"
@@ -31,10 +32,7 @@ def main():
     # ----------------------------------------------------------------
     # STEP 1 — Load emails
     # ----------------------------------------------------------------
-    # If we already parsed and saved the emails before, load the fast
-    # CSV version. Otherwise parse the raw files (takes ~15 mins).
-    # ----------------------------------------------------------------
-    print("\n[1/4] Loading emails...")
+    print("\n[1/5] Loading emails...")
 
     if Path(PROCESSED_PATH).exists():
         df = load_processed(PROCESSED_PATH)
@@ -43,50 +41,52 @@ def main():
         df = load_emails(RAW_DATA_PATH)
         save_processed(df, PROCESSED_PATH)
 
-    # Use a smaller sample for faster testing — remove this line for full run
-    df = df.sample(n=min(5000, len(df)), random_state=42).reset_index(drop=True)
+    # Filter to only emails between executives
+    print("  Filtering to executive-only emails...")
+    df = filter_executives_only(df, RAW_DATA_PATH)
+
+    # TEST MODE: use a small sample for faster debugging
+    # Change to False (or remove) for the full run
+    TEST_MODE = True
+    if TEST_MODE:
+        df = df.sample(n=min(2000, len(df)), random_state=42).reset_index(drop=True)
+        print(f"  TEST MODE: sampled {len(df):,} emails")
 
     print(f"  {len(df):,} emails loaded")
     print(f"  {df['sender'].nunique():,} unique senders")
-    print(f"  Date range: {df['date'].min().date()} → {df['date'].max().date()}")
+    print(f"  Date range: {df['date'].min().date()} -> {df['date'].max().date()}")
 
     # ----------------------------------------------------------------
-    # STEP 2 — Social Network Analysis
+    # STEP 2 — Network Analysis
     # Builds the graph, classifies each person (Hub / Gatekeeper etc.)
-    # and detects communities.
+    # and detects communities. Produces features used in Stage 2.
     # ----------------------------------------------------------------
-    results = Path(RESULTS_PATH)
-    if (results / "person_classes.csv").exists() and (results / "communities.json").exists():
-        print("\n[2/4] Social network analysis — SKIPPED (results already exist)")
-    else:
-        print("\n[2/4] Running social network analysis...")
-        graph, person_df = run_network_analysis(df, RESULTS_PATH)
+    print("\n[2/5] Running network analysis...")
+    graph, person_df = run_network_analysis(df, RESULTS_PATH)
 
     # ----------------------------------------------------------------
-    # STEP 3 — Friends & Enemies (Sentiment Analysis)
-    # Scores the sentiment of every email, then computes the
-    # average sentiment between every pair of people.
+    # STEP 3 — Stage 1: Email-Level Scoring
+    # Claude labels 500 emails -> train binary classifier (compare 3 models)
+    # -> score all emails with personal_score + sentiment_score
     # ----------------------------------------------------------------
-    if (results / "pair_sentiments.csv").exists():
-        print("\n[3/4] Sentiment analysis — SKIPPED (results already exist)")
-    else:
-        print("\n[3/4] Running sentiment analysis (friends & enemies)...")
-        df, pairs_df = run_sentiment_analysis(df, RESULTS_PATH)
+    print("\n[3/5] Running Stage 1 (email-level scoring)...")
+    df = run_stage1(df, RESULTS_PATH)
 
     # ----------------------------------------------------------------
-    # STEP 4 — Office Romance Detection
-    # Labels 500 emails with Claude, trains a classifier,
-    # applies it to all emails, finds romantic pairs.
-    #
-    # NOTE: Requires ANTHROPIC_API_KEY environment variable to be set.
-    # On first run this calls the Claude API (~500 calls).
-    # On subsequent runs it loads saved labels from disk.
+    # STEP 4 — Stage 2: Pair-Level Relationship Clustering
+    # Build 17-feature vector per pair -> cluster with K-Means + DBSCAN
+    # -> interpret clusters as relationship types
     # ----------------------------------------------------------------
-    if (results / "romance_pairs.csv").exists():
-        print("\n[4/4] Romance detection — SKIPPED (results already exist)")
-    else:
-        print("\n[4/4] Running romance detection...")
-        df, romance_pairs_df, _ = run_romance_analysis(df, RESULTS_PATH)
+    print("\n[4/5] Running Stage 2 (pair-level clustering)...")
+    pair_features = run_stage2(df, person_df, RESULTS_PATH)
+
+    # ----------------------------------------------------------------
+    # STEP 5 — Stage 3: Cluster Interpretation
+    # Compute z-scores per cluster, pull sample emails, ask Claude
+    # to name each relationship type
+    # ----------------------------------------------------------------
+    print("\n[5/5] Running Stage 3 (cluster interpretation)...")
+    pair_features = run_stage3(pair_features, df, RESULTS_PATH)
 
     # ----------------------------------------------------------------
     # DONE
