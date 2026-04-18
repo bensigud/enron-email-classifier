@@ -1,4 +1,2 @@
-"""
-Classifier utilities — now handled directly in stage1.py.
-This file is kept for backwards compatibility with imports.
-"""
+# This file is intentionally empty.
+# Classification logic lives in stage1.py.

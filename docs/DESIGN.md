@@ -3,48 +3,63 @@
 
 **Course:** RAF620M — Introduction to Machine Learning and AI
 **Team:** Atli, Benedikt, Hugo
-**Date:** 2026-04-15
-**Status:** v2
+**Date:** 2026-04-18
+**Status:** v3
 
 ---
 
 ## 1. Overview
 
-This document describes how the project is built — what files exist, what each one does, and how all the pieces connect together.
+This project builds an ML pipeline that classifies the **relationships between people** at Enron based on their email communication. Most Enron projects online classify emails (spam, fraud) or analyse the network in isolation. Ours classifies *relationships* — and does so using a theoretically grounded framework.
 
 The project has 3 main parts:
-1. **Data pipeline** — load and clean the raw Enron emails
-2. **Two-stage ML pipeline** — classify emails, then cluster relationships
-3. **Interactive UI** — a Streamlit app to explore the results and chat with Claude
-
-### What makes this project different
-
-Most Enron projects online focus on network analysis or sentiment analysis in isolation. Our contribution is a **two-stage ML pipeline** that connects NLP-based email classification with network features to discover relationship types between people — something no existing project does.
-
-- **Stage 1 (Email-level):** A supervised binary classifier that scores every email on a professional-to-personal spectrum, plus VADER sentiment scoring for emotional tone.
-- **Stage 2 (Pair-level):** Unsupervised clustering that combines Stage 1 scores with network features to discover natural relationship types between pairs of people.
-
-The network analysis is not a standalone analysis — it produces **features that feed directly into the ML pipeline**.
+1. **Data pipeline** — load, clean, and filter emails to ~150 executives
+2. **Four-stage ML pipeline** — score emails, build pair features, cluster, interpret
+3. **Interactive UI** — a Streamlit app with interactive network graph and Claude chat
 
 ---
 
-## 2. Project Structure
+## 2. Theoretical Foundation
+
+Our feature engineering is grounded in **Gilbert & Karahalios (2009)**, who adapted **Granovetter's (1973)** tie strength theory for digital communication. They identified 7 dimensions that predict relationship strength, achieving 85% accuracy on Facebook data.
+
+We measure 6 of the 7 dimensions from email data:
+
+| # | Dimension | Measured? | How we measure it | Gilbert's contribution |
+|---|---|---|---|---|
+| 1 | **Intimacy** | Yes | Claude labels (1-5) → ML classifier | 32.8% (highest) |
+| 2 | **Intensity** | Yes | Email count, frequency | 19.7% |
+| 3 | **Duration** | Yes | Days between first and last email | 16.5% |
+| 4 | **Structural** | Yes | Same community, shared connections | Minor linear, important modulating |
+| 5 | **Emotional support** | Yes | Claude labels (1-5) → ML classifier | Part of intimacy grouping |
+| 6 | **Social distance** | Yes | Degree difference, pagerank ratio | Part of structural grouping |
+| 7 | **Reciprocal services** | No | Would require detecting request-response patterns in email threads — beyond scope | Part of intensity grouping |
+
+**References:**
+- Granovetter, M. (1973). "The Strength of Weak Ties." *American Journal of Sociology*, 78(6), 1360-1380.
+- Gilbert, E. & Karahalios, K. (2009). "Predicting Tie Strength with Social Media." *Proceedings of CHI 2009*, ACM, 211-220.
+
+---
+
+## 3. Project Structure
 
 ```
 Enron Project/
 |
-├── app.py                  # Streamlit UI — run this to launch the app
+├── app.py                  # Streamlit UI (interactive network graph + Claude chat)
 ├── main.py                 # Run the full pipeline from command line
 ├── requirements.txt        # All Python libraries needed
 |
 ├── src/
 │   ├── __init__.py
-│   ├── loader.py           # Load and parse raw Enron emails
+│   ├── loader.py           # Load, parse, and filter raw Enron emails
 │   ├── network.py          # Social network graph + person classification
-│   ├── stage1.py           # Stage 1: Email-level scoring (classifier + VADER)
-│   ├── stage2.py           # Stage 2: Pair-level feature engineering + clustering
+│   ├── stage1.py           # Stage 1: Email-level scoring (2 ML classifiers + VADER)
+│   ├── stage2.py           # Stage 2: Pair-level feature engineering
+│   ├── stage3.py           # Stage 3: Unsupervised clustering (K-Means + DBSCAN)
+│   ├── stage4.py           # Stage 4: Cluster interpretation (z-scores + Claude naming)
 │   ├── claude_client.py    # Claude API — labeling + chat assistant
-│   └── utils.py            # Shared plotting and evaluation helpers
+│   └── utils.py            # Shared helpers
 |
 ├── data/
 │   ├── raw/                # Raw Enron emails (downloaded, not in git)
@@ -59,42 +74,52 @@ Enron Project/
 
 ---
 
-## 3. Data Flow
+## 4. Data Flow
 
 ```
-Raw emails (data/raw/)
+Raw emails (data/raw/maildir/)
         |
-    loader.py            --> clean pandas DataFrame (all emails)
+    loader.py            --> clean DataFrame, filtered to ~150 executives only
         |
         ├── network.py   --> social graph, person classes, network features
         |
-        ├── stage1.py    --> email-level scores (personal_score + sentiment_score)
-        |                    - Claude labels 500 emails (professional vs personal)
-        |                    - Train binary classifier (LogReg vs SVM vs RF)
-        |                    - Apply to all emails --> personal_score (0.0 to 1.0)
-        |                    - VADER sentiment     --> sentiment_score (-1.0 to +1.0)
+        ├── stage1.py    --> email-level scores
+        |                    - Claude labels 500 emails on 2 scales:
+        |                      intimacy (1-5) and warmth (1-5)
+        |                    - Train 2 ML classifiers (LogReg vs SVM vs RF)
+        |                    - Apply to all emails --> intimacy_score + warmth_score
+        |                    - VADER sentiment     --> sentiment_score
         |
-        └── stage2.py    --> pair-level relationship clustering
-                             - Build feature vector per pair (17 features)
-                             - Sources: Stage 1 scores + email patterns + network features
-                             - Cluster with K-Means and DBSCAN, compare both
-                             - Interpret clusters as relationship types
+        ├── stage2.py    --> pair-level feature vectors (20 features)
+        |                    - Aggregate Stage 1 scores per pair
+        |                    - Add email patterns (count, duration, direction)
+        |                    - Add network features (community, degree, pagerank)
         |
-    data/results/        --> all results saved (CSVs, plots, metrics)
+        ├── stage3.py    --> unsupervised clustering
+        |                    - Standardize features
+        |                    - K-Means (K=3..7) vs DBSCAN, compare by silhouette
         |
-    app.py               --> Streamlit UI to explore results
+        └── stage4.py    --> cluster interpretation
+                             - Z-score analysis per cluster
+                             - Sample emails per cluster
+                             - Claude names each relationship type
+        |
+    data/results/        --> all results saved
+        |
+    app.py               --> Interactive Streamlit UI
 ```
 
 ---
 
-## 4. Module Design
+## 5. Module Design
 
-### 4.1 `src/loader.py` — Data Loader
-**What it does:** Reads the raw Enron email files and returns a clean DataFrame.
+### 5.1 `src/loader.py` — Data Loader
 
-**Input:** Raw email files from `data/raw/`
+**What it does:** Reads raw Enron email files, cleans them, and filters to only emails between the ~150 executives (people who have a mailbox in the dataset).
 
-**Output:** A pandas DataFrame with these columns:
+**Input:** Raw email files from `data/raw/maildir/`
+
+**Output:** A pandas DataFrame with columns:
 
 | Column | Description |
 |---|---|
@@ -108,29 +133,18 @@ Raw emails (data/raw/)
 **Key functions:**
 ```python
 def load_emails(path) -> pd.DataFrame
-    # Reads all raw email files using multiprocessing, returns clean DataFrame
-
 def load_processed(path) -> pd.DataFrame
-    # Loads previously saved CSV (fast reload)
-
 def save_processed(df, path)
-    # Saves cleaned DataFrame to CSV for reuse
+def filter_executives_only(df, data_path) -> pd.DataFrame
 ```
 
 ---
 
-### 4.2 `src/network.py` — Social Network Analysis
-**What it does:** Builds the email communication graph, computes network features per person, and classifies people into network roles. These features are used as **inputs to the Stage 2 clustering**.
+### 5.2 `src/network.py` — Social Network Analysis
 
-**Input:** Clean emails DataFrame from `loader.py`
+**What it does:** Builds the email communication graph, computes network features per person, classifies people into network roles, and detects communities. Produces features that map to Gilbert's **Structural** and **Social distance** dimensions.
 
-**Output:**
-- A NetworkX graph object
-- A DataFrame of person features and classes (saved to `data/results/person_classes.csv`)
-- Community assignments (saved to `data/results/communities.json`)
-- Network visualisation plot (saved to `data/results/network_plot.png`)
-
-**Person classes (for visualisation and UI):**
+**Person classes (for visualisation):**
 
 | Class | How it is detected |
 |---|---|
@@ -140,222 +154,240 @@ def save_processed(df, path)
 | Follower | Connected to Hubs but low own centrality |
 | Isolated | Bottom 10% by number of contacts |
 
-**Network features produced per person (used in Stage 2):**
+**Network features per person (used in Stage 2):**
 
-| Feature | Description |
-|---|---|
-| `out_degree` | Number of unique people this person emailed |
-| `in_degree` | Number of unique people who emailed this person |
-| `total_degree` | out_degree + in_degree |
-| `betweenness` | How often this person sits on shortest paths between others |
-| `clustering` | How tightly connected this person's contacts are to each other |
-| `pagerank` | Importance score (similar to Google PageRank) |
-| `community` | Which community/cluster this person belongs to |
-
-**Key functions:**
-```python
-def build_graph(df) -> nx.DiGraph
-def compute_network_features(graph) -> pd.DataFrame
-def classify_person(features_df) -> pd.DataFrame
-def detect_communities(graph) -> dict
-def plot_network(graph, features_df, output_path)
-def run_network_analysis(df, output_dir) -> (graph, features_df)
-```
+| Feature | Description | Gilbert dimension |
+|---|---|---|
+| `total_degree` | Total unique contacts | Social distance |
+| `betweenness` | How often on shortest paths between others | Structural |
+| `pagerank` | Importance score | Social distance |
+| `community` | Community assignment | Structural |
 
 ---
 
-### 4.3 `src/stage1.py` — Stage 1: Email-Level Scoring
-**What it does:** Scores every email on two dimensions: how personal it is (ML classifier) and how positive/negative its tone is (VADER).
+### 5.3 `src/stage1.py` — Stage 1: Email-Level Scoring
 
-This is the core AI component of the project.
+**What it does:** Scores every email on three dimensions. This is the core AI component.
 
-**Input:** Clean emails DataFrame
+**Output per email:**
 
-**Output:** The same DataFrame with two new columns:
-- `personal_score` — probability from 0.0 (professional) to 1.0 (personal), from the trained classifier
-- `sentiment_score` — compound score from -1.0 (very negative) to +1.0 (very positive), from VADER
+| Score | Source | Gilbert dimension | Range |
+|---|---|---|---|
+| `intimacy_score` | ML classifier trained on Claude labels | Intimacy | 0.0 – 1.0 |
+| `warmth_score` | ML classifier trained on Claude labels | Emotional support | 0.0 – 1.0 |
+| `sentiment_score` | VADER | Emotional support (backup) | -1.0 – +1.0 |
 
-**How the personal classifier works:**
+**How the ML classifiers work:**
 
-1. **Labeling:** Claude API labels 500 random emails as `professional` or `personal` (binary).
-2. **Training:** We convert email text to numbers using TF-IDF (Term Frequency-Inverse Document Frequency) and train three classifiers:
+1. **Labeling:** Claude API labels 500 random emails on two scales (one API call per email, both scales rated in the same call):
+   - Intimacy (1-5): 1=formal business, 5=deeply personal/romantic
+   - Warmth (1-5): 1=hostile/cold, 5=loving/supportive
+2. **Training:** For each scale, we convert labels to binary (1-2 = low, 4-5 = high, 3 = excluded) and train three classifiers using TF-IDF features:
    - Logistic Regression
    - Support Vector Machine (SVM)
    - Random Forest
-3. **Evaluation:** We compare all three using 5-fold cross-validation and report precision, recall, F1, and confusion matrices. The best-performing model is selected.
-4. **Prediction:** The selected model scores all emails. We use `predict_proba` to get a continuous score (0.0–1.0) rather than a hard label.
+3. **Evaluation:** 5-fold cross-validation, precision/recall/F1, confusion matrices. Best model selected per scale.
+4. **Prediction:** Best model scores all emails using `predict_proba` for continuous scores.
 
-**Why two scores?**
-- `personal_score` measures **what** the email is about (content/topic)
-- `sentiment_score` measures **how** the email is written (tone/emotion)
-- A personal email can be positive ("I miss you") or negative ("I can't believe you did that")
-- A professional email can be positive ("Great work") or negative ("This is unacceptable")
-- These are independent signals that together give a richer picture
+**Why two ML classifiers + VADER?**
+- Intimacy measures **what** they share (personal topics vs work topics)
+- Warmth measures **how** they relate (hostile vs supportive vs loving)
+- Sentiment (VADER) provides an independent backup signal for emotional tone
+- These are independent dimensions — a personal email can be warm ("I miss you") or cold ("I can't believe you did that")
 
 **Key functions:**
 ```python
 def score_sentiment(df) -> pd.DataFrame
-    # Adds sentiment_score column using VADER
-
-def train_personal_classifier(labeled_df) -> dict
-    # Trains LogReg, SVM, RF — returns best model + comparison metrics
-
-def classify_all_emails(df, model) -> pd.DataFrame
-    # Applies trained model to all emails, adds personal_score column
-
+def train_classifier(labeled_df, scale_name, label_col, output_dir) -> dict
+def classify_all_emails(df, pipeline, score_col) -> pd.DataFrame
 def run_stage1(df, output_dir) -> pd.DataFrame
-    # Full Stage 1 pipeline: label + train + compare + classify + save
 ```
 
 ---
 
-### 4.4 `src/stage2.py` — Stage 2: Pair-Level Relationship Clustering
-**What it does:** For every pair of people who exchanged enough emails, builds a feature vector combining Stage 1 scores with network features, then uses unsupervised clustering to discover natural relationship types.
+### 5.4 `src/stage2.py` — Stage 2: Pair-Level Feature Engineering
 
-**Input:**
-- Emails DataFrame with `personal_score` and `sentiment_score` (from Stage 1)
-- Person features DataFrame (from network.py)
+**What it does:** For every pair of executives who exchanged enough emails, builds a feature vector from Stage 1 scores + email patterns + network features. These features map to 6 of Gilbert's 7 dimensions.
 
-**Output:**
-- A DataFrame of pair features with cluster assignments (saved to `data/results/relationship_pairs.csv`)
-- Cluster interpretation (saved to `data/results/cluster_profiles.csv`)
-- Plots: silhouette scores, cluster distributions, feature heatmap
+**Feature vector per pair (20 features):**
 
-**Feature vector per pair (17 features from 3 sources):**
-
-*From Stage 1 (aggregated across emails):*
+*Intimacy dimension (Gilbert #1) — from Stage 1:*
 
 | Feature | What it captures |
 |---|---|
-| `avg_personal_score` | How personal their communication is overall |
-| `avg_sentiment` | How positive/negative their tone is overall |
-| `personal_score_std` | Is it consistently personal or does it swing? |
-| `sentiment_std` | Is the tone consistent or volatile? |
-| `personal_a_to_b` | How personally A writes to B |
-| `personal_b_to_a` | How personally B writes to A |
-| `personal_imbalance` | Difference — is one side more personal? |
-| `sentiment_a_to_b` | How positive A is toward B |
-| `sentiment_b_to_a` | How positive B is toward A |
-| `sentiment_imbalance` | Is one side warmer than the other? |
+| `avg_intimacy` | How intimate their communication is overall |
+| `intimacy_a_to_b` | How intimately A writes to B |
+| `intimacy_b_to_a` | How intimately B writes to A |
+| `intimacy_imbalance` | Is intimacy one-sided? |
 
-*From email patterns:*
+*Emotional support dimension (Gilbert #5) — from Stage 1:*
+
+| Feature | What it captures |
+|---|---|
+| `avg_warmth` | How warm/supportive their communication is |
+| `warmth_a_to_b` | How warmly A writes to B |
+| `warmth_b_to_a` | How warmly B writes to A |
+| `warmth_imbalance` | Is warmth one-sided? |
+| `avg_sentiment` | VADER sentiment (backup emotional signal) |
+
+*Intensity dimension (Gilbert #2) — from email patterns:*
 
 | Feature | What it captures |
 |---|---|
 | `email_count` | How much they communicate |
 | `direction_ratio` | Balanced (0.5) vs one-sided (1.0) |
 
-*From network analysis:*
+*Duration dimension (Gilbert #3) — from timestamps:*
+
+| Feature | What it captures |
+|---|---|
+| `time_span_days` | Days between first and last email |
+
+*Structural dimension (Gilbert #4) — from network:*
+
+| Feature | What it captures |
+|---|---|
+| `same_community` | Are they in the same cluster? (1 or 0) |
+
+*Social distance dimension (Gilbert #6) — from network:*
 
 | Feature | What it captures |
 |---|---|
 | `sender_degree` | How connected person A is |
 | `recipient_degree` | How connected person B is |
-| `degree_difference` | Are they at similar levels in the network? |
-| `same_community` | Are they in the same cluster? (1 or 0) |
+| `degree_difference` | Are they at similar levels? |
 | `pagerank_ratio` | Ratio of importance scores |
 
-**Clustering approach:**
+*Variance features (stability of communication):*
 
-1. Standardise all features (StandardScaler) so no single feature dominates.
-2. Run **K-Means** with K = 3, 4, 5, 6, 7. Use silhouette score to pick the best K.
-3. Run **DBSCAN** and let it find the number of clusters automatically.
-4. Compare both methods. Pick the one that gives more interpretable results.
-5. **Interpret clusters:** For each cluster, examine the average feature values and assign a human-readable label (e.g., "Professional", "Friendly", "Hostile", "Romantic", "Mentorship" — or whatever the data reveals).
+| Feature | What it captures |
+|---|---|
+| `intimacy_std` | Is intimacy consistent or does it swing? |
+| `warmth_std` | Is warmth consistent or volatile? |
+| `sentiment_std` | Is sentiment consistent or volatile? |
 
 **Key functions:**
 ```python
 def build_pair_features(df, person_features_df) -> pd.DataFrame
-    # Builds the 17-feature vector for every qualifying pair
-
-def cluster_relationships(pair_features_df) -> (pd.DataFrame, dict)
-    # Runs K-Means + DBSCAN, returns labeled pairs + metrics
-
-def interpret_clusters(pair_features_df) -> pd.DataFrame
-    # Computes cluster centroids for interpretation
-
 def run_stage2(df, person_features_df, output_dir) -> pd.DataFrame
-    # Full Stage 2 pipeline: features + cluster + interpret + save
 ```
 
 ---
 
-### 4.5 `src/claude_client.py` — Claude API
-**What it does:** Handles all communication with the Claude API.
+### 5.5 `src/stage3.py` — Stage 3: Unsupervised Clustering
 
-**Used for two things:**
-1. Labeling emails for Stage 1 (professional vs personal) — during analysis
-2. Answering questions in the UI chat assistant — during presentation
+**What it does:** Takes the 20-feature pair vectors and discovers natural groupings using unsupervised clustering.
+
+**Approach:**
+1. Standardise all features (StandardScaler) so no single feature dominates
+2. Run **K-Means** with K = 3, 4, 5, 6, 7 — pick best by silhouette score
+3. Run **DBSCAN** — it finds the number of clusters automatically
+4. Compare both methods, pick the one with better silhouette score
 
 **Key functions:**
 ```python
-def label_email(email_text) -> str
-    # Asks Claude to classify one email as professional or personal
+def cluster_relationships(pair_features_df, output_dir) -> pd.DataFrame
+def run_stage3(pair_features_df, output_dir) -> pd.DataFrame
+```
+
+---
+
+### 5.6 `src/stage4.py` — Stage 4: Cluster Interpretation
+
+**What it does:** Interprets the clusters and assigns human-readable relationship type names.
+
+**Approach:**
+1. Compute **z-scores** for each cluster centroid vs global mean (which features make each cluster distinctive)
+2. Identify **top distinctive features** per cluster
+3. Pull **sample emails** from representative pairs in each cluster
+4. Send cluster profile + z-scores + sample emails to **Claude** and ask it to name the relationship type
+
+**Expected relationship types (depending on what data reveals):**
+
+| Type | Intimacy | Warmth | Intensity | Duration | Social distance |
+|---|---|---|---|---|---|
+| Professional | Low | Neutral | Any | Any | Any |
+| Friendly | Low-med | High | Medium+ | Long | Low |
+| Close/Romantic | High | High | High | Long | Low |
+| Hostile | Any | Very low | Any | Any | Any |
+| Mentorship | Medium | Medium-high | Medium | Long | High |
+| Distant | Low | Low | Low | Short | Any |
+
+*Note: these are expected patterns. The clustering may discover different or additional types — that is a finding, not a failure.*
+
+**Key functions:**
+```python
+def compute_cluster_zscores(pair_features_df) -> pd.DataFrame
+def get_sample_emails_per_cluster(pair_features_df, emails_df) -> dict
+def name_clusters_with_claude(zscores_df, top_features, sample_emails, profiles) -> dict
+def run_stage4(pair_features_df, emails_df, output_dir) -> pd.DataFrame
+```
+
+---
+
+### 5.7 `src/claude_client.py` — Claude API
+
+**What it does:** Handles all communication with the Claude API.
+
+**Used for three things:**
+1. Labeling emails on intimacy + warmth scales (Stage 1)
+2. Naming relationship clusters (Stage 4)
+3. Answering questions in the UI chat assistant (presentation)
+
+**Key functions:**
+```python
+def label_email(email_text) -> dict
+    # Returns {"intimacy": 1-5, "warmth": 1-5}
 
 def label_email_batch(df, sample_size) -> pd.DataFrame
-    # Labels a random sample of emails using Claude
-
 def ask_question(question, context) -> str
-    # Answers a user question based on analysis results
-
 def save_labeled_sample(df, output_dir)
 def load_labeled_sample(output_dir) -> pd.DataFrame
 ```
 
 ---
 
-### 4.6 `src/utils.py` — Shared Utilities
-**What it does:** Plotting helpers, evaluation functions, and shared constants.
+## 6. The Streamlit App (`app.py`)
 
-**Key functions:**
-```python
-def plot_confusion_matrix(y_true, y_pred, output_path)
-def plot_model_comparison(results_dict, output_path)
-def plot_silhouette_scores(scores_dict, output_path)
-def plot_cluster_distribution(pair_df, output_path)
-```
-
----
-
-## 5. The Streamlit App (`app.py`)
-
-The UI loads pre-computed results from `data/results/` and displays them.
-It does NOT re-run the analyses — they are run once via `main.py` and saved.
+The UI loads pre-computed results from `data/results/` and displays them interactively.
 
 ### Pages:
 
 **1. Overview**
-- Project summary, key numbers, how the pipeline works
+- Project summary, key numbers, pipeline explanation
+- Model comparison chart + confusion matrices
 
-**2. Social Network**
-- Network graph visualisation
-- Person class legend and distribution
-- Top connected people table
+**2. Social Network (Interactive)**
+- Interactive pyvis network graph — drag, zoom, hover, double-click
+- Nodes coloured by person class, edges coloured by relationship type
+- Double-click a person to navigate to their profile
+- Focus dropdown to explore one person's network
 
 **3. Person Profile**
-- Select any employee from a dropdown
-- Shows: person class, network stats, their relationships and types
+- Select any executive, see their network stats
+- Mini network graph showing their connections
+- Relationships table with type names
+- Email viewer — read actual emails between them and any connection
 
 **4. Relationships**
-- Explore relationship clusters discovered by Stage 2
-- Filter by relationship type
-- Look up any pair and see their relationship class, scores, and emails
-- Cluster feature profiles (what makes each type distinct)
+- Relationship types discovered, with descriptions
+- Cluster feature heatmap
+- Filter by type, explore pairs
+- Look up any pair and see their relationship details + emails
 
 **5. Ask the Data — Claude Chat**
-- Text input box
-- User types a question in plain English
-- Claude answers based on the analysis results loaded as context
+- Natural language questions about the analysis
+- Claude answers based on loaded results
 
 ---
 
-## 6. How to Run
+## 7. How to Run
 
 ```bash
 # Step 1 — Install dependencies
 pip install -r requirements.txt
 
-# Step 2 — Download data (see docs/REPORT.md for instructions)
+# Step 2 — Download Enron data to data/raw/maildir/
 
 # Step 3 — Run the full pipeline
 python main.py
@@ -366,7 +398,7 @@ streamlit run app.py
 
 ---
 
-## 7. Requirements (`requirements.txt`)
+## 8. Requirements
 
 ```
 pandas
@@ -375,16 +407,19 @@ nltk
 networkx
 matplotlib
 streamlit
+pyvis
 anthropic
 python-dotenv
 ```
 
 ---
 
-## 8. Evaluation Strategy
+## 9. Evaluation Strategy
 
 | Component | How We Evaluate |
 |---|---|
-| Stage 1 classifier | 5-fold cross-validation. Precision, recall, F1, confusion matrix. Compare LogReg vs SVM vs RF. |
-| Stage 2 clustering | Silhouette score to pick best K. Compare K-Means vs DBSCAN. Interpret cluster centroids. |
-| Overall pipeline | Manual validation: team reviews 50 pairs and checks if assigned cluster matches human judgment. |
+| Stage 1: Intimacy classifier | 5-fold CV. Precision, recall, F1, confusion matrix. Compare LogReg vs SVM vs RF. |
+| Stage 1: Warmth classifier | Same as above, independently. |
+| Stage 3: Clustering | Silhouette score to pick best K. Compare K-Means vs DBSCAN. |
+| Stage 4: Naming | Z-score analysis shows what makes each cluster distinct. |
+| Overall pipeline | Manual validation: team reviews 50 pairs and checks if assigned type matches human judgment. |

@@ -4,5 +4,6 @@ nltk
 networkx
 matplotlib
 streamlit
+pyvis
 anthropic
 python-dotenv

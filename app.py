@@ -8,10 +8,10 @@ Launch with:  streamlit run app.py
 import json
 import pandas as pd
 import numpy as np
-import networkx as nx
-import matplotlib.pyplot as plt
 import streamlit as st
+import streamlit.components.v1 as components
 from pathlib import Path
+from pyvis.network import Network
 from src.claude_client import ask_question
 
 # ----------------------------------------------------------------
@@ -40,6 +40,17 @@ CLUSTER_COLORS = [
     "#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6",
     "#e91e8c", "#1abc9c", "#95a5a6",
 ]
+
+RELATIONSHIP_COLORS = {
+    "Professional":    "#3498db",
+    "Professional Network": "#3498db",
+    "Friendly":        "#2ecc71",
+    "Friendly Colleagues": "#2ecc71",
+    "Hostile":         "#e74c3c",
+    "Mentorship":      "#f39c12",
+    "Romantic":        "#e91e8c",
+    "Executive Outreach": "#e67e22",
+}
 
 
 # ----------------------------------------------------------------
@@ -115,6 +126,11 @@ def load_emails():
     return df
 
 
+def _short_name(email_addr):
+    """Convert email to display name: john.lavorato@enron.com -> John Lavorato"""
+    return email_addr.split("@")[0].replace(".", " ").title() if email_addr else ""
+
+
 def show_email_viewer(emails_df, person_a, person_b):
     """Show emails between two people in an expandable viewer."""
     if emails_df is None:
@@ -151,6 +167,159 @@ def show_email_viewer(emails_df, person_a, person_b):
         st.caption(f"Showing 20 of {len(matched)} emails.")
 
 
+def build_interactive_network(person_df, pairs_df, cluster_names_dict,
+                              selected_person=None, max_nodes=100):
+    """
+    Build an interactive pyvis network graph.
+    If a person is selected, highlight them and their connections.
+    Returns HTML string.
+    """
+    net = Network(
+        height="600px",
+        width="100%",
+        bgcolor="#1a1a2e",
+        font_color="white",
+        directed=False,
+    )
+    net.barnes_hut(
+        gravity=-3000,
+        central_gravity=0.3,
+        spring_length=150,
+        spring_strength=0.01,
+    )
+
+    # Get the people who appear in relationship pairs (they have interesting data)
+    pair_people = set()
+    if pairs_df is not None:
+        pair_people = set(pairs_df["person_a"].tolist() + pairs_df["person_b"].tolist())
+
+    # Pick which nodes to show
+    if selected_person and selected_person in person_df["person"].values:
+        # Show selected person + their connections + some top people
+        connected = set()
+        if pairs_df is not None:
+            connected = set(
+                pairs_df[pairs_df["person_a"] == selected_person]["person_b"].tolist() +
+                pairs_df[pairs_df["person_b"] == selected_person]["person_a"].tolist()
+            )
+        # Also include top connected people for context
+        top_people = set(person_df.nlargest(30, "total_degree")["person"].tolist())
+        show_people = {selected_person} | connected | top_people
+    else:
+        # Show top connected people + all people in pairs
+        top_people = set(person_df.nlargest(max_nodes, "total_degree")["person"].tolist())
+        show_people = top_people | pair_people
+
+    feat = person_df.set_index("person")
+
+    # Add nodes
+    for person in show_people:
+        if person not in feat.index:
+            continue
+        row = feat.loc[person]
+        cls = row["person_class"]
+        color = PERSON_COLORS.get(cls, "#aaa")
+        degree = int(row["total_degree"])
+        size = max(10, min(50, degree * 0.5))
+        name = _short_name(person)
+
+        # Highlight selected person
+        border_width = 1
+        border_color = color
+        if person == selected_person:
+            border_width = 4
+            border_color = "#ffffff"
+            size = max(size, 30)
+
+        title = (
+            f"<b>{name}</b><br>"
+            f"Email: {person}<br>"
+            f"Class: {cls}<br>"
+            f"Connections: {degree}<br>"
+            f"Betweenness: {row['betweenness']:.3f}<br>"
+            f"PageRank: {row['pagerank']:.4f}"
+        )
+
+        net.add_node(
+            person,
+            label=name,
+            title=title,
+            color={
+                "background": color,
+                "border": border_color,
+                "highlight": {"background": "#ffffff", "border": color},
+            },
+            size=size,
+            borderWidth=border_width,
+            font={"size": 10, "color": "white"},
+        )
+
+    # Add edges from relationship pairs
+    if pairs_df is not None:
+        for _, row in pairs_df.iterrows():
+            a, b = row["person_a"], row["person_b"]
+            if a in show_people and b in show_people:
+                if a in feat.index and b in feat.index:
+                    cluster_id = int(row["cluster"])
+                    rel_name = cluster_names_dict.get(cluster_id, {}).get("name", f"Cluster {cluster_id}")
+                    edge_color = RELATIONSHIP_COLORS.get(rel_name, "#555555")
+
+                    # Highlight edges connected to selected person
+                    width = 1.5
+                    if selected_person and (a == selected_person or b == selected_person):
+                        width = 4
+
+                    title = (
+                        f"{_short_name(a)} ↔ {_short_name(b)}<br>"
+                        f"Type: {rel_name}<br>"
+                        f"Intimacy: {row['avg_intimacy']:.3f}<br>"
+                        f"Warmth: {row['avg_warmth']:.3f}<br>"
+                        f"Sentiment: {row['avg_sentiment']:.3f}<br>"
+                        f"Emails: {int(row['email_count'])}"
+                    )
+
+                    net.add_edge(
+                        a, b,
+                        color=edge_color,
+                        width=width,
+                        title=title,
+                    )
+
+    # Generate HTML
+    html = net.generate_html()
+
+    # Inject custom JS: when a node is clicked, update the URL query param
+    # so Streamlit can read it
+    click_js = """
+    <script>
+    // After the network is drawn, add click handler
+    var checkNetwork = setInterval(function() {
+        if (typeof network !== 'undefined') {
+            clearInterval(checkNetwork);
+            network.on("doubleClick", function(params) {
+                if (params.nodes.length > 0) {
+                    var nodeId = params.nodes[0];
+                    // Send to parent Streamlit frame via URL
+                    window.parent.postMessage({
+                        type: "streamlit:setComponentValue",
+                        value: nodeId
+                    }, "*");
+                    // Also update URL for Streamlit to read
+                    var url = new URL(window.parent.location);
+                    url.searchParams.set("selected", nodeId);
+                    window.parent.history.replaceState({}, "", url);
+                    window.parent.location.reload();
+                }
+            });
+        }
+    }, 100);
+    </script>
+    """
+    html = html.replace("</body>", click_js + "</body>")
+
+    return html
+
+
 def build_context_for_claude(person_df, pairs_df, cluster_profiles):
     """Build a text summary of findings to pass to Claude as context."""
     if person_df is None:
@@ -184,19 +353,16 @@ CLUSTER PROFILES (average features per cluster):
 {cluster_profiles.to_string(index=False)}
 """
 
-    # Most personal pairs
     if pairs_df is not None:
-        top_personal = pairs_df.nlargest(5, "avg_personal_score")
+        top_personal = pairs_df.nlargest(5, "avg_intimacy")
         context += f"""
 MOST PERSONAL PAIRS:
-{top_personal[['person_a','person_b','avg_personal_score','avg_sentiment']].to_string(index=False)}
+{top_personal[['person_a','person_b','avg_intimacy','avg_sentiment']].to_string(index=False)}
 """
-
-        # Most negative pairs
         most_negative = pairs_df.nsmallest(5, "avg_sentiment")
         context += f"""
 MOST NEGATIVE SENTIMENT PAIRS:
-{most_negative[['person_a','person_b','avg_sentiment','avg_personal_score']].to_string(index=False)}
+{most_negative[['person_a','person_b','avg_sentiment','avg_intimacy']].to_string(index=False)}
 """
 
     return context
@@ -230,6 +396,13 @@ cluster_names = load_cluster_names()
 
 data_ready = person_df is not None
 
+# Check URL for selected person (from graph click)
+query_params = st.query_params
+if "selected" in query_params:
+    st.session_state["selected_person"] = query_params["selected"]
+    # Switch to person profile page
+    if page != "👤 Person Profile":
+        st.query_params["selected"] = query_params["selected"]
 
 if not data_ready:
     st.warning("⚠️ No results found. Please run `python main.py` first to generate the analysis.")
@@ -246,16 +419,18 @@ if page == "🏠 Overview":
     scandals in history. The investigation released **~500,000 internal emails**
     — giving us a rare window into the private world of a company falling apart.
 
-    This app explores those emails through a **two-stage ML pipeline**:
+    This app explores those emails through a **four-stage ML pipeline**:
     """)
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.info("**🕸️ Network Analysis**\nWho emailed who? Who were the key players?")
-        st.success("**📊 Stage 1: Email Scoring**\nBinary classifier + VADER sentiment on every email")
+        st.info("**📊 Stage 1: Email Scoring**\nIntimacy + warmth classifiers + VADER sentiment")
     with col2:
-        st.warning("**🔗 Stage 2: Relationship Clustering**\nUnsupervised clustering discovers relationship types")
-        st.error("**🤖 Ask the Data**\nChat with Claude about the findings")
+        st.warning("**🔧 Stage 2: Pair Features**\n20-feature vector per pair (Gilbert dimensions)")
+    with col3:
+        st.success("**🔗 Stage 3: Clustering**\nK-Means + DBSCAN discover relationship types")
+    with col4:
+        st.error("**🏷️ Stage 4: Naming**\nClaude interprets and names each cluster")
 
     if data_ready:
         st.markdown("---")
@@ -264,59 +439,105 @@ if page == "🏠 Overview":
         col1.metric("People", f"{len(person_df):,}")
         col2.metric("Hubs", f"{(person_df['person_class']=='Hub').sum()}")
         col3.metric("Pairs Analysed", f"{len(pairs_df):,}" if pairs_df is not None else "—")
-        col4.metric("Clusters Found",
-                     f"{pairs_df['cluster'].nunique()}" if pairs_df is not None else "—")
+        col4.metric("Relationship Types",
+                     f"{len(cluster_names)}" if cluster_names else "—")
 
         # Show model comparison if available
-        if model_comparison:
+        comp_img = RESULTS_PATH / "model_comparison.png"
+        if comp_img.exists():
             st.markdown("---")
-            st.markdown("### Stage 1: Model Comparison")
-            comp_img = RESULTS_PATH / "model_comparison.png"
-            if comp_img.exists():
-                st.image(str(comp_img), use_container_width=True)
+            st.markdown("### Stage 1: Model Comparison (Intimacy + Warmth)")
+            st.image(str(comp_img), use_container_width=True)
 
-            cm_img = RESULTS_PATH / "confusion_matrix.png"
-            if cm_img.exists():
-                st.markdown("### Confusion Matrix (Best Model)")
-                st.image(str(cm_img), use_container_width=True)
+            st.markdown("### Confusion Matrices")
+            col1, col2 = st.columns(2)
+            cm_intimacy = RESULTS_PATH / "confusion_matrix_intimacy.png"
+            cm_warmth = RESULTS_PATH / "confusion_matrix_warmth.png"
+            if cm_intimacy.exists():
+                col1.image(str(cm_intimacy), use_container_width=True)
+            if cm_warmth.exists():
+                col2.image(str(cm_warmth), use_container_width=True)
 
 
 # ================================================================
-# PAGE 2 — Social Network
+# PAGE 2 — Social Network (Interactive)
 # ================================================================
 elif page == "🕸️ Social Network":
     st.title("🕸️ The Social Network")
-    st.markdown("Each dot is a person. Each line is an email connection. Size = how connected they are.")
-
-    plot_path = RESULTS_PATH / "network_plot.png"
-    if plot_path.exists():
-        st.image(str(plot_path), use_container_width=True)
-    else:
-        st.info("Network plot not generated yet. Run main.py first.")
 
     if data_ready:
-        st.markdown("---")
-        st.markdown("### Person Class Legend")
+        st.markdown(
+            "Hover over a node to see details. **Double-click a person** to go to their profile. "
+            "Drag nodes to rearrange. Scroll to zoom."
+        )
+
+        # Person class legend
         cols = st.columns(5)
         for i, (cls, color) in enumerate(PERSON_COLORS.items()):
             cols[i].markdown(
-                f"<div style='background:{color};padding:8px;border-radius:6px;"
-                f"color:white;text-align:center;font-weight:bold'>{cls}</div>",
+                f"<div style='background:{color};padding:6px;border-radius:6px;"
+                f"color:white;text-align:center;font-weight:bold;font-size:0.85em'>{cls}</div>",
                 unsafe_allow_html=True
             )
 
-        st.markdown("---")
-        st.markdown("### Class Distribution")
-        dist = person_df["person_class"].value_counts().reset_index()
-        dist.columns = ["Class", "Count"]
-        st.bar_chart(dist.set_index("Class"))
+        # Optional: filter to show a specific person's network
+        people_in_pairs = sorted(set(
+            (pairs_df["person_a"].tolist() + pairs_df["person_b"].tolist())
+            if pairs_df is not None else []
+        ))
+        focus_options = ["Everyone (top connected)"] + [
+            f"{_short_name(p)} ({p})" for p in people_in_pairs
+        ]
+        focus = st.selectbox("Focus on a person", focus_options)
 
-        st.markdown("### Top 20 Most Connected People")
-        top = person_df.nlargest(20, "total_degree")[
-            ["person", "person_class", "total_degree", "betweenness", "pagerank"]
-        ].reset_index(drop=True)
-        top.index += 1
-        st.dataframe(top, use_container_width=True)
+        selected = None
+        if focus != "Everyone (top connected)":
+            # Extract email from the label
+            selected = focus.split("(")[1].rstrip(")")
+
+        # Build and display the interactive graph
+        html = build_interactive_network(
+            person_df, pairs_df, cluster_names, selected_person=selected
+        )
+        components.html(html, height=620, scrolling=False)
+
+        # Relationship type legend (edge colors)
+        if cluster_names:
+            st.markdown("---")
+            st.markdown("### Edge Colors = Relationship Types")
+            cols = st.columns(min(len(cluster_names), 4))
+            for i, (cid, info) in enumerate(sorted(cluster_names.items())):
+                color = RELATIONSHIP_COLORS.get(info["name"], CLUSTER_COLORS[cid % len(CLUSTER_COLORS)])
+                cols[i % len(cols)].markdown(
+                    f"<div style='background:{color};padding:6px;border-radius:6px;"
+                    f"color:white;text-align:center;font-size:0.85em'>"
+                    f"{info['name']}</div>",
+                    unsafe_allow_html=True
+                )
+
+        # Stats below the graph
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("### Class Distribution")
+            dist = person_df["person_class"].value_counts().reset_index()
+            dist.columns = ["Class", "Count"]
+            st.bar_chart(dist.set_index("Class"))
+
+        with col2:
+            st.markdown("### Top 15 Most Connected")
+            top = person_df.nlargest(15, "total_degree")[
+                ["person", "person_class", "total_degree", "betweenness"]
+            ].reset_index(drop=True)
+            top["Name"] = top["person"].apply(_short_name)
+            top.index += 1
+            st.dataframe(
+                top[["Name", "person_class", "total_degree", "betweenness"]],
+                use_container_width=True
+            )
+    else:
+        st.info("Run main.py to generate results.")
 
 
 # ================================================================
@@ -324,11 +545,35 @@ elif page == "🕸️ Social Network":
 # ================================================================
 elif page == "👤 Person Profile":
     st.title("👤 Person Profile")
-    st.markdown("Select any Enron employee to see their social profile.")
+    st.markdown("Select any Enron executive to see their social profile and relationships.")
 
     if data_ready:
-        people = sorted(person_df["person"].tolist())
-        selected = st.selectbox("Choose a person", people)
+        # Only show people who appear in pairs (executives with relationships)
+        people_in_pairs = set()
+        if pairs_df is not None:
+            people_in_pairs = set(
+                pairs_df["person_a"].tolist() + pairs_df["person_b"].tolist()
+            )
+
+        # All people sorted by degree, but prioritize those with relationships
+        all_people = sorted(person_df["person"].tolist())
+        pair_people_sorted = sorted(people_in_pairs)
+
+        # Default selection from URL or session state
+        default_person = pair_people_sorted[0] if pair_people_sorted else all_people[0]
+        if "selected_person" in st.session_state:
+            sp = st.session_state["selected_person"]
+            if sp in all_people:
+                default_person = sp
+
+        default_idx = all_people.index(default_person) if default_person in all_people else 0
+
+        selected = st.selectbox(
+            "Choose a person",
+            all_people,
+            index=default_idx,
+            format_func=lambda p: f"{_short_name(p)} ({p})"
+        )
 
         row = person_df[person_df["person"] == selected].iloc[0]
         cls = row["person_class"]
@@ -336,7 +581,7 @@ elif page == "👤 Person Profile":
 
         st.markdown(f"""
         <div style='background:{color};padding:16px;border-radius:10px;color:white;margin:12px 0'>
-            <h2 style='margin:0'>{selected.split('@')[0].replace('.', ' ').title()}</h2>
+            <h2 style='margin:0'>{_short_name(selected)}</h2>
             <p style='margin:4px 0;font-size:1.1em'>{selected}</p>
             <h3 style='margin:4px 0'>Class: {cls}</h3>
         </div>
@@ -348,19 +593,27 @@ elif page == "👤 Person Profile":
         col3.metric("Betweenness", f"{row['betweenness']:.3f}")
         col4.metric("PageRank", f"{row['pagerank']:.4f}")
 
+        # Show their mini network graph
         if pairs_df is not None:
-            st.markdown("---")
-            st.markdown("### Relationships")
             person_pairs = pairs_df[
                 (pairs_df["person_a"] == selected) | (pairs_df["person_b"] == selected)
             ].copy()
 
             if len(person_pairs) > 0:
+                st.markdown("---")
+                st.markdown("### Their Network")
+                mini_html = build_interactive_network(
+                    person_df, pairs_df, cluster_names, selected_person=selected
+                )
+                components.html(mini_html, height=450, scrolling=False)
+
+                st.markdown("### Relationships")
                 person_pairs["other_person"] = person_pairs.apply(
                     lambda r: r["person_b"] if r["person_a"] == selected else r["person_a"],
                     axis=1
                 )
-                # Use relationship_type if available, fall back to cluster number
+                person_pairs["Name"] = person_pairs["other_person"].apply(_short_name)
+
                 if "relationship_type" in person_pairs.columns and cluster_names:
                     type_col = "relationship_type"
                 else:
@@ -368,15 +621,30 @@ elif page == "👤 Person Profile":
                         lambda c: cluster_names.get(int(c), {}).get("name", f"Cluster {c}")
                     )
                     type_col = "relationship_type"
+
                 display = person_pairs[[
-                    "other_person", type_col, "avg_personal_score",
+                    "Name", type_col, "avg_intimacy",
                     "avg_sentiment", "email_count"
-                ]].head(20)
-                display.columns = ["Connected To", "Relationship", "Personal Score",
+                ]]
+                display.columns = ["Person", "Relationship", "Intimacy",
                                    "Sentiment", "Emails"]
                 st.dataframe(display.reset_index(drop=True), use_container_width=True)
+
+                # Click on a relationship to see emails
+                st.markdown("---")
+                st.markdown("### 📨 Read Their Emails")
+                pair_labels = [
+                    f"{_short_name(r['other_person'])} — {r.get('relationship_type', 'Unknown')}"
+                    for _, r in person_pairs.iterrows()
+                ]
+                if pair_labels:
+                    selected_pair = st.selectbox("Select a relationship", pair_labels)
+                    idx = pair_labels.index(selected_pair)
+                    other = person_pairs.iloc[idx]["other_person"]
+                    show_email_viewer(load_emails(), selected, other)
             else:
-                st.info("No pair data found for this person.")
+                st.info("No relationship data found for this person. "
+                        "They may not have enough emails with other executives.")
     else:
         st.info("Run main.py to generate results.")
 
@@ -403,13 +671,6 @@ elif page == "🔗 Relationships":
         if sil_img.exists():
             st.image(str(sil_img), use_container_width=True)
 
-        # Cluster distribution
-        st.markdown("---")
-        st.markdown("### Cluster Distribution")
-        dist_img = RESULTS_PATH / "cluster_distribution.png"
-        if dist_img.exists():
-            st.image(str(dist_img), use_container_width=True)
-
         # Cluster profiles (heatmap)
         st.markdown("---")
         st.markdown("### Cluster Feature Profiles")
@@ -418,9 +679,6 @@ elif page == "🔗 Relationships":
         if heatmap_img.exists():
             st.image(str(heatmap_img), use_container_width=True)
 
-        if cluster_profiles is not None:
-            st.dataframe(cluster_profiles, use_container_width=True)
-
         # Cluster names summary
         if cluster_names:
             st.markdown("---")
@@ -428,7 +686,7 @@ elif page == "🔗 Relationships":
             for cid in sorted(cluster_names.keys()):
                 info = cluster_names[cid]
                 count = (pairs_df["cluster"] == cid).sum()
-                color = CLUSTER_COLORS[cid % len(CLUSTER_COLORS)]
+                color = RELATIONSHIP_COLORS.get(info["name"], CLUSTER_COLORS[cid % len(CLUSTER_COLORS)])
                 st.markdown(
                     f"<div style='background:{color};padding:10px;border-radius:8px;"
                     f"color:white;margin:6px 0'>"
@@ -452,14 +710,14 @@ elif page == "🔗 Relationships":
         )
 
         cluster_pairs = pairs_df[pairs_df["cluster"] == selected_label].copy()
-        cluster_pairs["Person A"] = cluster_pairs["person_a"].str.split("@").str[0]
-        cluster_pairs["Person B"] = cluster_pairs["person_b"].str.split("@").str[0]
+        cluster_pairs["Person A"] = cluster_pairs["person_a"].apply(_short_name)
+        cluster_pairs["Person B"] = cluster_pairs["person_b"].apply(_short_name)
 
-        display_cols = ["Person A", "Person B", "avg_personal_score",
-                        "avg_sentiment", "email_count", "personal_imbalance"]
+        display_cols = ["Person A", "Person B", "avg_intimacy",
+                        "avg_warmth", "avg_sentiment", "email_count"]
         st.dataframe(
             cluster_pairs[display_cols]
-            .sort_values("avg_personal_score", ascending=False)
+            .sort_values("avg_intimacy", ascending=False)
             .head(30)
             .reset_index(drop=True),
             use_container_width=True
@@ -472,8 +730,14 @@ elif page == "🔗 Relationships":
             pairs_df["person_a"].tolist() + pairs_df["person_b"].tolist()
         ))
         col1, col2 = st.columns(2)
-        person_a = col1.selectbox("Person A", all_people, key="pa")
-        person_b = col2.selectbox("Person B", all_people, key="pb", index=1)
+        person_a = col1.selectbox(
+            "Person A", all_people, key="pa",
+            format_func=lambda p: _short_name(p)
+        )
+        person_b = col2.selectbox(
+            "Person B", all_people, key="pb", index=min(1, len(all_people)-1),
+            format_func=lambda p: _short_name(p)
+        )
 
         match = pairs_df[
             ((pairs_df["person_a"] == person_a) & (pairs_df["person_b"] == person_b)) |
@@ -484,13 +748,13 @@ elif page == "🔗 Relationships":
             row = match.iloc[0]
             cluster_id = int(row["cluster"])
             cluster_label = cluster_names.get(cluster_id, {}).get("name", f"Cluster {cluster_id}")
-            color = CLUSTER_COLORS[cluster_id % len(CLUSTER_COLORS)]
+            color = RELATIONSHIP_COLORS.get(cluster_label, CLUSTER_COLORS[cluster_id % len(CLUSTER_COLORS)])
             st.markdown(
                 f"<div style='background:{color};padding:12px;border-radius:8px;"
                 f"color:white;text-align:center;font-size:1.3em'>"
                 f"<b>{cluster_label}</b> — "
-                f"Personal: {row['avg_personal_score']:.3f} | "
-                f"Sentiment: {row['avg_sentiment']:.3f} | "
+                f"Intimacy: {row['avg_intimacy']:.3f} | "
+                f"Warmth: {row.get('avg_warmth', 0):.3f} | "
                 f"Emails: {int(row['email_count'])}"
                 f"</div>",
                 unsafe_allow_html=True
