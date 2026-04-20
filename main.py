@@ -14,11 +14,12 @@ explored in the Streamlit UI:
 import json
 import sys
 import time
+import pandas as pd
 from pathlib import Path
-from src.loader import load_emails, load_processed, save_processed, filter_executives_only
+from src.loader import load_emails, load_processed, save_processed, filter_executives_only, get_exec_addresses
 from src.network import run_network_analysis
 from src.stage1 import run_stage1
-from src.stage2 import run_stage2
+from src.stage2 import run_stage2, flag_outlier_relationships
 from src.stage3 import run_stage3
 from src.stage4 import run_stage4
 
@@ -90,6 +91,149 @@ def load_config(config_path: str = None) -> dict:
     return config
 
 
+def _find_external_contacts(df_all, raw_data_path, results_path):
+    """
+    Identify top external contacts (non-Enron) that executives
+    email frequently. Saves to external_contacts.csv for the UI to
+    display on the network graph with a different color.
+    """
+    exec_addresses = get_exec_addresses(raw_data_path)
+
+    # Find non-executive recipients that executives email
+    # Find non-Enron recipients (outside the company)
+    external_counts = {}  # (exec, external) -> count
+    for _, row in df_all.iterrows():
+        sender = row["sender"]
+        if sender not in exec_addresses:
+            continue
+        recipients = row["recipients"] if isinstance(row["recipients"], list) else []
+        for recip in recipients:
+            if "@" in recip and "enron.com" not in recip.lower():
+                key = (sender, recip)
+                external_counts[key] = external_counts.get(key, 0) + 1
+
+    if not external_counts:
+        return
+
+    # Build DataFrame of external contacts
+    rows = []
+    for (exec_addr, ext_addr), count in external_counts.items():
+        rows.append({
+            "executive": exec_addr,
+            "external_contact": ext_addr,
+            "email_count": count,
+            "domain": ext_addr.split("@")[1] if "@" in ext_addr else "",
+        })
+
+    ext_df = pd.DataFrame(rows)
+
+    # Keep only contacts with 3+ emails (filter noise)
+    ext_df = ext_df[ext_df["email_count"] >= 3]
+    ext_df = ext_df.sort_values("email_count", ascending=False)
+
+    # Flag likely personal contacts (non-enron domains)
+    ext_df["is_personal"] = ~ext_df["domain"].str.contains("enron", case=False, na=False)
+
+    # Score the emails to external contacts using trained models (if available)
+    from src.stage1 import _load_models
+    intimacy_pipeline, warmth_pipeline = _load_models(results_path)
+
+    if intimacy_pipeline and warmth_pipeline:
+        print("    Scoring external contact emails with trained models...")
+
+        # Build per-pair average scores
+        pair_scores = {}
+        for _, row in df_all.iterrows():
+            sender = row["sender"]
+            if sender not in exec_addresses:
+                continue
+            recips = row["recipients"] if isinstance(row["recipients"], list) else []
+            body = row["body"] if isinstance(row["body"], str) else ""
+            if len(body) < 20:
+                continue
+            for recip in recips:
+                if recip not in exec_addresses and "@" in recip:
+                    key = (sender, recip)
+                    if key not in pair_scores:
+                        pair_scores[key] = {"bodies": []}
+                    pair_scores[key]["bodies"].append(body)
+
+        # Score in bulk per pair
+        ext_intimacy = {}
+        ext_warmth = {}
+        for key, data in pair_scores.items():
+            bodies = data["bodies"]
+            if len(bodies) < 3:
+                continue
+            texts = pd.Series(bodies).fillna("")
+            # Intimacy
+            classes = list(intimacy_pipeline.classes_)
+            high_idx = classes.index("high")
+            int_probs = intimacy_pipeline.predict_proba(texts)
+            ext_intimacy[key] = float(int_probs[:, high_idx].mean())
+            # Warmth
+            warm_raw = warmth_pipeline.predict(texts)
+            ext_warmth[key] = float(((warm_raw - 1) / 4).clip(0, 1).mean())
+
+        # Add scores to ext_df
+        ext_df["avg_intimacy"] = ext_df.apply(
+            lambda r: ext_intimacy.get((r["executive"], r["external_contact"]), None),
+            axis=1,
+        )
+        ext_df["avg_warmth"] = ext_df.apply(
+            lambda r: ext_warmth.get((r["executive"], r["external_contact"]), None),
+            axis=1,
+        )
+
+        # Classify external contact relationships using score thresholds
+        scored = ext_df[ext_df["avg_intimacy"].notna()].copy()
+        if len(scored) > 0:
+            int_mean = scored["avg_intimacy"].mean()
+            int_std = scored["avg_intimacy"].std()
+            warm_mean = scored["avg_warmth"].mean()
+            warm_std = scored["avg_warmth"].std()
+
+            def _classify_external(row):
+                intimacy = row.get("avg_intimacy")
+                warmth = row.get("avg_warmth")
+                if pd.isna(intimacy) or pd.isna(warmth):
+                    return "Unknown"
+                int_z = (intimacy - int_mean) / max(int_std, 0.001)
+                warm_z = (warmth - warm_mean) / max(warm_std, 0.001)
+                # Romantic: 3+ sigma on both
+                if int_z > 3 and warm_z > 3:
+                    return "Romantic"
+                # Close Personal: 2+ sigma on both
+                if int_z > 2 and warm_z > 2:
+                    return "Close Personal"
+                # Friendly: above average on both
+                if int_z > 1 and warm_z > 1:
+                    return "Friendly"
+                # Cold/Distant: below average on warmth
+                if warm_z < -1:
+                    return "Distant"
+                # Default
+                return "Business"
+
+            ext_df["relationship_type"] = ext_df.apply(_classify_external, axis=1)
+
+            # Summary
+            type_counts = ext_df["relationship_type"].value_counts()
+            print(f"    External contact types:")
+            for t, c in type_counts.items():
+                print(f"      {t}: {c}")
+
+            # Keep romantic_flag for backward compatibility
+            ext_df["romantic_flag"] = (ext_df["relationship_type"] == "Romantic")
+
+    out = Path(results_path)
+    out.mkdir(parents=True, exist_ok=True)
+    ext_df.to_csv(out / "external_contacts.csv", index=False)
+
+    n_personal = ext_df["is_personal"].sum()
+    print(f"    Found {len(ext_df)} external contacts ({n_personal} personal)")
+
+
 def main(config: dict = None):
     if config is None:
         config = DEFAULT_CONFIG.copy()
@@ -126,7 +270,12 @@ def main(config: dict = None):
         df_all = load_emails(RAW_DATA_PATH)
         save_processed(df_all, PROCESSED_PATH)
 
-    print("  Filtering to executive-only emails...")
+    # Identify external contacts before filtering them out
+    print("  Identifying external contacts...")
+    _find_external_contacts(df_all, RAW_DATA_PATH, RESULTS_PATH)
+
+    print("  Filtering to internal Enron emails...")
+    exec_addresses = get_exec_addresses(RAW_DATA_PATH)
     df_all = filter_executives_only(df_all, RAW_DATA_PATH)
 
     # Sort deterministically so batches are consistent
@@ -186,7 +335,7 @@ def main(config: dict = None):
     # ----------------------------------------------------------------
     _update_progress("network", "running", "Building network graph...")
     print("\n[2/6] Running network analysis...")
-    graph, person_df = run_network_analysis(df, RESULTS_PATH)
+    graph, person_df = run_network_analysis(df, RESULTS_PATH, exec_addresses=exec_addresses)
 
     n_people = len(person_df)
     n_hubs = int((person_df["person_class"] == "Hub").sum())
@@ -249,6 +398,12 @@ def main(config: dict = None):
         "pairs": n_pairs,
         "features": n_features,
     })
+
+    # ----------------------------------------------------------------
+    # STEP 4b — Flag outlier relationships
+    # ----------------------------------------------------------------
+    print("\n[4b/6] Flagging outlier relationships...")
+    pair_features = flag_outlier_relationships(pair_features)
 
     # ----------------------------------------------------------------
     # STEP 5 — Stage 3: Unsupervised Clustering

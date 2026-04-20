@@ -51,9 +51,13 @@ def cluster_relationships(pair_features_df: pd.DataFrame,
         gmm_models[k] = gmm
         print(f"    GMM K={k}: silhouette={score:.3f}, BIC={gmm.bic(X_scaled):.0f}")
 
-    best_gmm_k = max(gmm_scores, key=gmm_scores.get)
+    # Pick K using BIC (lower is better) — silhouette alone always picks K=3
+    # BIC balances fit quality with model complexity
+    gmm_bics = {k: gmm_models[k].bic(X_scaled) for k in gmm_models}
+    best_gmm_k = min(gmm_bics, key=gmm_bics.get)
     best_gmm_score = gmm_scores[best_gmm_k]
-    print(f"    Best GMM: K={best_gmm_k} (silhouette={best_gmm_score:.3f})")
+    print(f"    Best GMM by BIC: K={best_gmm_k} "
+          f"(BIC={gmm_bics[best_gmm_k]:.0f}, silhouette={best_gmm_score:.3f})")
 
     # --- K-Means (hard clustering, for comparison) ---
     kmeans_scores = {}

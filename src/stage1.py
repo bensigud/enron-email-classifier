@@ -183,25 +183,33 @@ def train_classifier(labeled_df: pd.DataFrame, scale_name: str,
             "significant": bool(p_value < 0.05),
         }
 
-    # Confusion matrix on 80/20 split
+    # Confusion matrix on 80/20 split — for ALL models
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y)
 
     models2 = _make_models()
-    eval_pipeline = Pipeline([
-        ("tfidf", TfidfVectorizer(
-            max_features=5000, ngram_range=(1, 2),
-            stop_words="english", min_df=1)),
-        ("clf", models2[best_name]),
-    ])
-    eval_pipeline.fit(X_train, y_train)
-    y_pred = eval_pipeline.predict(X_test)
+    for model_name, model in models2.items():
+        eval_pipeline = Pipeline([
+            ("tfidf", TfidfVectorizer(
+                max_features=5000, ngram_range=(1, 2),
+                stop_words="english", min_df=1)),
+            ("clf", model),
+        ])
+        eval_pipeline.fit(X_train, y_train)
+        y_pred = eval_pipeline.predict(X_test)
 
-    print(f"\n    {scale_name} classification report ({best_name}):")
-    print(classification_report(y_test, y_pred, zero_division=0))
+        if model_name == best_name:
+            print(f"\n    {scale_name} classification report ({model_name}):")
+            print(classification_report(y_test, y_pred, zero_division=0))
 
-    _plot_confusion_matrix(y_test, y_pred,
-                           f"{scale_name} — {best_name}", output_dir, scale_name)
+        # Save confusion matrix for each model
+        safe_name = model_name.lower().replace(" ", "_")
+        _plot_confusion_matrix(
+            y_test, y_pred,
+            f"{scale_name} — {model_name}",
+            output_dir,
+            f"{scale_name}_{safe_name}",
+        )
 
     # Retrain on ALL data for production
     models3 = _make_models()

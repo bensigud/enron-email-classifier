@@ -425,7 +425,8 @@ def build_pair_features(df: pd.DataFrame,
         merged["std_sentiment"].fillna(0) + merged["std_sentiment_reverse"].fillna(0)) / 2
 
     # === INTENSITY dimension ===
-    features["email_count"] = merged["email_count"]
+    # Log-transform to prevent high-volume pairs from dominating clustering
+    features["email_count"] = np.log1p(merged["email_count"])
     a_count = merged["email_count"] - merged["email_count_reverse"]
     features["direction_ratio"] = (a_count / merged["email_count"]).clip(0, 1)
 
@@ -444,9 +445,11 @@ def build_pair_features(df: pd.DataFrame,
     latest = pd.concat([
         merged["last_date"], merged["last_date_reverse"]
     ], axis=1).max(axis=1)
-    features["time_span_days"] = (
+    raw_days = (
         pd.to_datetime(latest) - pd.to_datetime(earliest)
     ).dt.days.fillna(0).clip(lower=0)
+    # Log-transform to prevent dominating clustering (range 0-7000+ → 0-9)
+    features["time_span_days"] = np.log1p(raw_days)
 
     # === TEMPORAL PATTERNS — Ureña-Carrion et al. (2020) ===
     temporal_df = _compute_temporal_features(edge_df, features)
@@ -526,6 +529,93 @@ FEATURE_COLS = [
     # Language style matching — Ireland et al. 2011 (3)
     "style_similarity", "formality_diff", "pronoun_rate_diff",
 ]
+
+
+def flag_outlier_relationships(pair_features_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flag rare relationship types that clustering would miss due to
+    low frequency. Uses score thresholds on pair features.
+
+    Flags are additive — a pair can have multiple flags.
+    Flagged pairs are still clustered, but their flags are preserved
+    as an independent signal.
+
+    Returns the DataFrame with a new 'flags' column (comma-separated
+    string of flags, empty string if none).
+    """
+    print("  Flagging outlier relationships...")
+
+    df = pair_features_df.copy()
+    flags = [[] for _ in range(len(df))]
+
+    # --- Romantic / deeply personal ---
+    # Must be 2+ standard deviations above mean on BOTH scales
+    if "avg_intimacy" in df.columns and "avg_warmth" in df.columns:
+        int_threshold = df["avg_intimacy"].mean() + 3 * df["avg_intimacy"].std()
+        warm_threshold = df["avg_warmth"].mean() + 3 * df["avg_warmth"].std()
+        romantic_mask = (df["avg_intimacy"] > int_threshold) & (df["avg_warmth"] > warm_threshold)
+        for i in df.index[romantic_mask]:
+            flags[df.index.get_loc(i)].append("Romantic")
+        n = romantic_mask.sum()
+        if n > 0:
+            print(f"    Romantic: {n} pairs (high intimacy + high warmth)")
+
+    # --- Hostile / adversarial ---
+    # Very low warmth AND negative sentiment
+    if "avg_warmth" in df.columns and "avg_sentiment" in df.columns:
+        warm_low = df["avg_warmth"].mean() - 3 * df["avg_warmth"].std()
+        sent_low = df["avg_sentiment"].mean() - 3 * df["avg_sentiment"].std()
+        hostile_mask = (df["avg_warmth"] < warm_low) & (df["avg_sentiment"] < sent_low)
+        for i in df.index[hostile_mask]:
+            flags[df.index.get_loc(i)].append("Hostile")
+        n = hostile_mask.sum()
+        if n > 0:
+            print(f"    Hostile: {n} pairs (low warmth + negative sentiment)")
+
+    # --- After-hours / personal ---
+    # High after-hours ratio suggests personal relationship
+    if "after_hours_ratio" in df.columns:
+        personal_mask = df["after_hours_ratio"] > 0.4
+        for i in df.index[personal_mask]:
+            flags[df.index.get_loc(i)].append("After-hours")
+        n = personal_mask.sum()
+        if n > 0:
+            print(f"    After-hours: {n} pairs (>40% outside work hours)")
+
+    # --- One-sided / power dynamic ---
+    # Very skewed direction ratio AND high social distance
+    if "direction_ratio" in df.columns and "degree_difference" in df.columns:
+        onesided_mask = (
+            ((df["direction_ratio"] > 0.85) | (df["direction_ratio"] < 0.15)) &
+            (df["degree_difference"] > df["degree_difference"].quantile(0.75))
+        )
+        for i in df.index[onesided_mask]:
+            flags[df.index.get_loc(i)].append("Hierarchical")
+        n = onesided_mask.sum()
+        if n > 0:
+            print(f"    Hierarchical: {n} pairs (one-sided + high degree difference)")
+
+    # --- High-intensity / crisis ---
+    # Very high email frequency + bursty pattern
+    if "emails_per_month" in df.columns:
+        epm_threshold = df["emails_per_month"].quantile(0.9)
+        intense_mask = df["emails_per_month"] > epm_threshold
+        if "burstiness" in df.columns:
+            intense_mask = intense_mask & (df["burstiness"] > 0.3)
+        for i in df.index[intense_mask]:
+            flags[df.index.get_loc(i)].append("High-intensity")
+        n = intense_mask.sum()
+        if n > 0:
+            print(f"    High-intensity: {n} pairs (top 10% frequency + bursty)")
+
+    # Build flags column
+    df["flags"] = [", ".join(f) if f else "" for f in flags]
+
+    n_flagged = (df["flags"] != "").sum()
+    print(f"    Total: {n_flagged} pairs flagged "
+          f"({n_flagged/len(df)*100:.1f}%)")
+
+    return df
 
 
 def save_results(pair_features_df: pd.DataFrame, output_dir: str):

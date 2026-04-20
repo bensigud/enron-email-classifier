@@ -156,18 +156,15 @@ def deduplicate_emails(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.sort_values("date").copy()
 
-    # Build a fingerprint from sender + first recipient + body start
-    def _fingerprint(row):
-        sender = row["sender"] or ""
-        recip = row["recipients"][0] if isinstance(row["recipients"], list) and row["recipients"] else ""
-        body = (row["body"] or "")[:100].strip().lower()
-        # Normalize whitespace for matching
-        body = re.sub(r"\s+", " ", body)
-        return f"{sender}|{recip}|{body}"
-
-    df["_fingerprint"] = df.apply(_fingerprint, axis=1)
-    df = df.drop_duplicates(subset="_fingerprint", keep="first")
-    df = df.drop(columns="_fingerprint")
+    # Dedup by sender + subject + date (same email appears in sender's
+    # sent folder AND recipient's inbox with different Message-IDs)
+    df["_dedup_key"] = (
+        df["sender"].fillna("") + "|" +
+        df["subject"].fillna("").str.lower().str[:50] + "|" +
+        df["date"].astype(str).str[:19]
+    )
+    df = df.drop_duplicates(subset="_dedup_key", keep="first")
+    df = df.drop(columns="_dedup_key")
 
     return df
 
@@ -263,59 +260,65 @@ def get_executive_addresses(data_path: str) -> set:
     return addresses
 
 
-def filter_executives_only(df: pd.DataFrame, data_path: str) -> pd.DataFrame:
+def get_exec_addresses(data_path: str) -> set:
     """
-    Filter the DataFrame to only keep emails where BOTH the sender
-    and at least one recipient are executives (have a mailbox in maildir).
-
-    We identify executive email addresses by looking at emails in each
-    person's "sent_items" or "sent" folder — the sender of those emails
-    is that executive's actual email address.
+    Find executive email addresses from maildir sent folders.
+    Executives = people who have a mailbox in the dataset (~150).
     """
     data_path = Path(data_path)
-
-    # Step 1: Find each executive's real email address from their sent folders
     exec_addresses = set()
     for folder in data_path.iterdir():
         if not folder.is_dir():
             continue
-        # Look for sent mail folders — these contain emails FROM this executive
-        sent_folders = []
         for subfolder in folder.iterdir():
             if subfolder.is_dir() and subfolder.name in ("sent", "sent_items", "_sent_mail"):
-                sent_folders.append(subfolder)
+                for sent_file in list(subfolder.rglob("*"))[:5]:
+                    try:
+                        raw = sent_file.read_text(errors="ignore")
+                        msg = email.message_from_string(raw)
+                        sender = msg.get("From", "").strip()
+                        if sender:
+                            addr = _clean_email(sender)
+                            if addr and "@" in addr:
+                                exec_addresses.add(addr)
+                                break
+                    except Exception:
+                        continue
 
-        # Get the sender address from emails in their sent folder
-        for sent_folder in sent_folders:
-            sent_files = [f for f in sent_folder.rglob("*") if f.is_file()]
-            for sent_file in sent_files[:5]:  # only need a few to find the address
-                try:
-                    raw = sent_file.read_text(errors="ignore")
-                    msg = email.message_from_string(raw)
-                    sender = msg.get("From", "").strip()
-                    if sender:
-                        addr = _clean_email(sender)
-                        if addr and "@" in addr:
-                            exec_addresses.add(addr)
-                            break
-                except Exception:
-                    continue
-
-    # Also include addresses derived from folder names as fallback
     exec_addresses.update(get_executive_addresses(str(data_path)))
+    return exec_addresses
 
+
+def filter_executives_only(df: pd.DataFrame, data_path: str) -> pd.DataFrame:
+    """
+    Filter to internal Enron emails (Option C):
+      - Keep emails where the sender is an executive (has a mailbox)
+      - Keep ALL @enron.com recipients (not just executives)
+      - This captures exec↔exec AND exec↔employee communication
+      - External contacts are handled separately
+    """
+    exec_addresses = get_exec_addresses(data_path)
     print(f"  Found {len(exec_addresses):,} executive email addresses")
 
-    # Filter: sender must be an executive
+    # Sender must be an executive (we only have full mailboxes for these)
     df = df[df["sender"].isin(exec_addresses)].copy()
 
-    # Filter: at least one recipient must be an executive
+    # Keep only @enron.com recipients (internal company emails)
     df["recipients"] = df["recipients"].apply(
-        lambda recips: [r for r in recips if r in exec_addresses]
+        lambda recips: [r for r in recips
+                        if isinstance(r, str) and "enron.com" in r.lower()]
     )
     df = df[df["recipients"].apply(len) > 0]
 
-    print(f"  After filtering: {len(df):,} emails between executives")
+    # Count how many unique people
+    all_people = set(df["sender"].tolist())
+    for recips in df["recipients"]:
+        all_people.update(recips)
+    n_exec = len(all_people & exec_addresses)
+    n_employee = len(all_people - exec_addresses)
+
+    print(f"  After filtering: {len(df):,} internal Enron emails")
+    print(f"  People: {len(all_people):,} ({n_exec} executives, {n_employee} employees)")
     return df
 
 

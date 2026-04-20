@@ -38,6 +38,8 @@ PERSON_COLORS = {
     "Inner Circle": "#9b59b6",
     "Follower":     "#3498db",
     "Isolated":     "#95a5a6",
+    "Employee":     "#1abc9c",
+    "External":     "#f1c40f",
 }
 
 PERSON_CLASS_DESCRIPTIONS = {
@@ -46,6 +48,8 @@ PERSON_CLASS_DESCRIPTIONS = {
     "Inner Circle": "High clustering + low reach — tight local group",
     "Follower":     "Average connectivity — regular employee",
     "Isolated":     "Bottom 10% by connections — peripheral",
+    "Employee":     "Enron employee — no mailbox in dataset",
+    "External":     "Non-executive — personal or business contact",
 }
 
 CLUSTER_COLORS = [
@@ -126,6 +130,14 @@ def load_communities():
         return {}
     with open(path) as f:
         return json.load(f)
+
+
+@st.cache_data
+def load_external_contacts():
+    path = RESULTS_PATH / "external_contacts.csv"
+    if not path.exists():
+        return None
+    return pd.read_csv(path)
 
 
 @st.cache_data
@@ -289,7 +301,8 @@ def show_email_viewer(emails_df, person_a, person_b):
 
 def build_interactive_network(person_df, pairs_df, cluster_names_dict,
                               selected_person=None, max_nodes=100,
-                              show_types=None, min_emails_filter=1):
+                              show_types=None, min_emails_filter=1,
+                              external_df=None):
     """
     Build an interactive pyvis network graph.
     If a person is selected, highlight them and their connections.
@@ -333,8 +346,13 @@ def build_interactive_network(person_df, pairs_df, cluster_names_dict,
         top_people = set(person_df.nlargest(30, "total_degree")["person"].tolist())
         show_people = {selected_person} | connected | top_people
     else:
-        top_people = set(person_df.nlargest(max_nodes, "total_degree")["person"].tolist())
-        show_people = top_people | pair_people
+        # Default view: show executives + people in pairs (not all 7K employees)
+        if "is_executive" in person_df.columns:
+            exec_people = set(person_df[person_df["is_executive"]]["person"].tolist())
+            show_people = exec_people | pair_people
+        else:
+            top_people = set(person_df.nlargest(max_nodes, "total_degree")["person"].tolist())
+            show_people = top_people | pair_people
 
     feat = person_df.set_index("person")
 
@@ -352,6 +370,11 @@ def build_interactive_network(person_df, pairs_df, cluster_names_dict,
             filtered_pairs[filtered_pairs["person_b"] == selected_person]["person_a"].tolist()
         )
 
+    # Compute size scaling based on the people we're showing (not all 7K)
+    show_degrees = [int(feat.loc[p, "total_degree"]) for p in show_people if p in feat.index]
+    max_degree = max(show_degrees) if show_degrees else 1
+    min_degree = min(show_degrees) if show_degrees else 0
+
     # Add nodes
     for person in show_people:
         if person not in feat.index:
@@ -360,7 +383,12 @@ def build_interactive_network(person_df, pairs_df, cluster_names_dict,
         cls = row["person_class"]
         color = PERSON_COLORS.get(cls, "#aaa")
         degree = int(row["total_degree"])
-        size = max(10, min(50, degree * 0.5))
+        # Scale size relative to the visible people (not absolute)
+        if max_degree > min_degree:
+            norm = (degree - min_degree) / (max_degree - min_degree)
+        else:
+            norm = 0.5
+        size = 10 + norm * 40  # range: 10 to 50
         name = _short_name(person)
 
         # Highlight selected person
@@ -388,11 +416,7 @@ def build_interactive_network(person_df, pairs_df, cluster_names_dict,
             person,
             label=name if show_label else "",
             title=title,
-            color={
-                "background": color,
-                "border": border_color,
-                "highlight": {"background": "#ffffff", "border": color},
-            },
+            color=color,
             size=size,
             borderWidth=border_width,
             font={"size": 11, "color": "white", "strokeWidth": 2, "strokeColor": "#000000"},
@@ -456,6 +480,79 @@ def build_interactive_network(person_df, pairs_df, cluster_names_dict,
                         label="",
                         font={"size": 0},
                     )
+
+    # --- Add external contacts if provided ---
+    if external_df is not None and len(external_df) > 0:
+        ext_color = PERSON_COLORS.get("External", "#f1c40f")
+
+        # Only show external contacts connected to visible people
+        visible_ext = external_df[
+            external_df["executive"].isin(show_people)
+        ].copy()
+
+        # If a person is selected, only show their external contacts
+        if selected_person:
+            visible_ext = visible_ext[visible_ext["executive"] == selected_person]
+
+        # Limit to top contacts to avoid clutter
+        visible_ext = visible_ext.nlargest(min(20, len(visible_ext)), "email_count")
+
+        EXT_TYPE_COLORS = {
+            "Romantic": "#e91e8c",
+            "Close Personal": "#9b59b6",
+            "Friendly": "#2ecc71",
+            "Business": "#f1c40f",
+            "Distant": "#95a5a6",
+        }
+
+        for _, erow in visible_ext.iterrows():
+            ext_addr = erow["external_contact"]
+            exec_addr = erow["executive"]
+            domain = erow.get("domain", "")
+            is_personal = erow.get("is_personal", False)
+            count = int(erow["email_count"])
+            ext_name = _short_name(ext_addr)
+            rel_type = erow.get("relationship_type", "Unknown")
+            intimacy = erow.get("avg_intimacy", 0)
+            warmth = erow.get("avg_warmth", 0)
+
+            node_color = EXT_TYPE_COLORS.get(rel_type, "#f1c40f")
+
+            # Add external node
+            net.add_node(
+                ext_addr,
+                label=f"{ext_name}\n({rel_type})",
+                title=(
+                    f"<b>{ext_name}</b><br>"
+                    f"Email: {ext_addr}<br>"
+                    f"Type: <b>{rel_type}</b><br>"
+                    f"Domain: {domain}<br>"
+                    f"Emails: {count}<br>"
+                    f"Intimacy: {intimacy:.2f}<br>"
+                    f"Warmth: {warmth:.2f}"
+                ),
+                color={
+                    "background": node_color,
+                    "border": "#ffffff" if rel_type in ("Romantic", "Close Personal") else "#888",
+                    "highlight": {"background": "#ffffff", "border": node_color},
+                },
+                size=max(8, min(25, count * 0.5)),
+                borderWidth=3 if rel_type in ("Romantic", "Close Personal") else 2,
+                shape="diamond",
+                font={"size": 9, "color": node_color},
+            )
+
+            # Add edge — color by relationship type
+            net.add_edge(
+                exec_addr, ext_addr,
+                color=node_color,
+                width=max(1, min(4, count * 0.1)),
+                dashes=True,
+                title=(
+                    f"{_short_name(exec_addr)} → {ext_name}<br>"
+                    f"Type: {rel_type} | {count} emails"
+                ),
+            )
 
     # Generate HTML
     html = net.generate_html()
@@ -725,7 +822,27 @@ if page == "🏋️ Training":
                     stat_text = f"{emails_processed:,} emails<br>{people:,} people, {hubs} hubs" if emails_processed else f"{people:,} {unit}"
                 elif key == "stage1":
                     labels = stats.get("labels", _count_csv_rows(check_file))
-                    stat_text = f"{emails_processed:,} emails<br>{labels:,} labeled" if emails_processed else f"{labels:,} {unit}"
+                    labels_str = f"{labels:,}" if isinstance(labels, (int, float)) else str(labels)
+                    # Load F1 / R² from saved model comparisons
+                    _int_path = RESULTS_PATH / "model_comparison_intimacy.json"
+                    _warm_path = RESULTS_PATH / "model_comparison_warmth.json"
+                    _f1_str = ""
+                    if _int_path.exists():
+                        _int_data = json.loads(_int_path.read_text())
+                        _best_int = max(
+                            (v for k, v in _int_data.items() if not k.startswith("_")),
+                            key=lambda v: v.get("f1", 0),
+                        )
+                        _f1_str += f"<br>Disclosure F1: {_best_int['f1']:.2f}"
+                    if _warm_path.exists():
+                        _warm_data = json.loads(_warm_path.read_text())
+                        _best_warm = max(
+                            (v for k, v in _warm_data.items() if not k.startswith("_")),
+                            key=lambda v: v.get("r2", 0),
+                        )
+                        _f1_str += f"<br>Responsive R²: {_best_warm['r2']:.2f}"
+                    stat_text = (f"{labels_str} labeled{_f1_str}" if _f1_str
+                                 else f"{labels_str} {unit}")
                 elif key == "stage2":
                     pairs = stats.get("pairs", _count_csv_rows(check_file))
                     stat_text = f"{emails_processed:,} emails<br>{pairs:,} pairs" if emails_processed else f"{pairs:,} {unit}"
@@ -1134,8 +1251,9 @@ if page == "🏋️ Training":
         if st.button("Reset", type="secondary", disabled=not confirm):
             results_dir = Path("data/results")
             keep = set(ALWAYS_KEEP)
-            if not also_delete_labels:
-                keep.add("claude_labeled_emails.csv")
+            if also_delete_labels:
+                keep.discard("claude_labeled_emails.csv")
+                keep.discard("batch_offset.json")
 
             if results_dir.exists():
                 deleted = 0
@@ -1193,23 +1311,120 @@ elif page == "🏠 Overview":
         col4.metric("Relationship Types",
                      f"{len(cluster_names)}" if cluster_names else "—")
 
-        # Show model comparison if available
+        # Show model performance
+        _int_path = RESULTS_PATH / "model_comparison_intimacy.json"
+        _warm_path = RESULTS_PATH / "model_comparison_warmth.json"
+
+        if _int_path.exists() or _warm_path.exists():
+            st.markdown("---")
+            st.markdown("### Model Performance")
+            st.markdown(
+                "These models were trained on Claude-labeled emails (with human corrections) "
+                "and then used to score **all** emails in the dataset."
+            )
+
+            mcol1, mcol2 = st.columns(2)
+
+            # --- Self-disclosure classifier ---
+            if _int_path.exists():
+                int_data = json.loads(_int_path.read_text())
+                model_names = [k for k in int_data if not k.startswith("_")]
+                best_int_name = max(model_names, key=lambda k: int_data[k].get("f1", 0))
+                best_int = int_data[best_int_name]
+                sig_info = int_data.get("_significance", {})
+
+                with mcol1:
+                    st.markdown("#### Self-Disclosure (Classifier)")
+                    st.markdown(f"**Best model: {best_int_name}**")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("F1", f"{best_int['f1']:.2f}")
+                    m2.metric("Accuracy", f"{best_int['accuracy']:.2f}")
+                    m3.metric("Precision", f"{best_int['precision']:.2f}")
+                    m4.metric("Recall", f"{best_int['recall']:.2f}")
+
+                    # All models comparison
+                    rows = []
+                    for name in model_names:
+                        d = int_data[name]
+                        rows.append({
+                            "Model": name,
+                            "F1": f"{d['f1']:.3f}",
+                            "Accuracy": f"{d['accuracy']:.3f}",
+                            "Precision": f"{d['precision']:.3f}",
+                            "Recall": f"{d['recall']:.3f}",
+                        })
+                    st.dataframe(pd.DataFrame(rows), hide_index=True)
+
+                    if sig_info:
+                        p = sig_info.get("p_value", 1)
+                        sig_text = f"p={p:.3f} ({'significant' if p < 0.05 else 'not significant'})"
+                        st.caption(
+                            f"{sig_info.get('best', '')} vs {sig_info.get('second', '')}: {sig_text}"
+                        )
+
+            # --- Responsiveness regressor ---
+            if _warm_path.exists():
+                warm_data = json.loads(_warm_path.read_text())
+                model_names_w = [k for k in warm_data if not k.startswith("_")]
+                best_warm_name = max(model_names_w, key=lambda k: warm_data[k].get("r2", 0))
+                best_warm = warm_data[best_warm_name]
+                sig_info_w = warm_data.get("_significance", {})
+
+                with mcol2:
+                    st.markdown("#### Responsiveness (Regressor)")
+                    st.markdown(f"**Best model: {best_warm_name}**")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("R²", f"{best_warm['r2']:.2f}")
+                    m2.metric("MAE", f"{best_warm['mae']:.2f}")
+                    m3.metric("RMSE", f"{best_warm['rmse']:.2f}")
+
+                    rows_w = []
+                    for name in model_names_w:
+                        d = warm_data[name]
+                        rows_w.append({
+                            "Model": name,
+                            "R²": f"{d['r2']:.3f}",
+                            "MAE": f"{d['mae']:.3f}",
+                            "RMSE": f"{d['rmse']:.3f}",
+                        })
+                    st.dataframe(pd.DataFrame(rows_w), hide_index=True)
+
+                    if sig_info_w:
+                        p = sig_info_w.get("p_value", 1)
+                        sig_text = f"p={p:.3f} ({'significant' if p < 0.05 else 'not significant'})"
+                        st.caption(
+                            f"{sig_info_w.get('best', '')} vs {sig_info_w.get('second', '')}: {sig_text}"
+                        )
+
+        # Show charts
         comp_img = RESULTS_PATH / "model_comparison.png"
         if comp_img.exists():
             st.markdown("---")
-            st.markdown("### Stage 1: Model Comparison (Self-Disclosure Classifier + Responsiveness Regressor)")
+            st.markdown("### Model Comparison Charts")
             st.image(str(comp_img), width='stretch')
 
-            st.markdown("### Evaluation")
-            col1, col2 = st.columns(2)
-            cm_intimacy = RESULTS_PATH / "confusion_matrix_intimacy.png"
+            # Confusion matrices for all 3 classifier models
+            st.markdown("#### Self-Disclosure — Confusion Matrices")
+            cm_cols = st.columns(3)
+            cm_models = [
+                ("Logistic Regression", "logistic_regression"),
+                ("SVM", "svm"),
+                ("Random Forest", "random_forest"),
+            ]
+            for i, (label, safe_name) in enumerate(cm_models):
+                cm_path = RESULTS_PATH / f"confusion_matrix_intimacy_{safe_name}.png"
+                # Fallback to old single-model file
+                if not cm_path.exists() and i == 0:
+                    cm_path = RESULTS_PATH / "confusion_matrix_intimacy.png"
+                if cm_path.exists():
+                    cm_cols[i].markdown(f"**{label}**")
+                    cm_cols[i].image(str(cm_path), width='stretch')
+
+            # Responsiveness scatter plot
             scatter_warmth = RESULTS_PATH / "scatter_warmth.png"
-            if cm_intimacy.exists():
-                col1.markdown("**Self-Disclosure — Confusion Matrix**")
-                col1.image(str(cm_intimacy), width='stretch')
             if scatter_warmth.exists():
-                col2.markdown("**Responsiveness — Predicted vs Actual**")
-                col2.image(str(scatter_warmth), width='stretch')
+                st.markdown("#### Responsiveness — Predicted vs Actual")
+                st.image(str(scatter_warmth), width='stretch')
 
 
 # ================================================================
@@ -1226,7 +1441,7 @@ elif page == "🕸️ Social Network":
 
         # Node legend (person classes)
         st.markdown("**Nodes** = people (coloured by role in network)")
-        cols = st.columns(5)
+        cols = st.columns(7)
         for i, (cls, color) in enumerate(PERSON_COLORS.items()):
             desc = PERSON_CLASS_DESCRIPTIONS.get(cls, "")
             cols[i].markdown(
@@ -1239,7 +1454,7 @@ elif page == "🕸️ Social Network":
             )
 
         # --- FILTER CONTROLS ---
-        filter_col1, filter_col2, filter_col3 = st.columns([2, 2, 1])
+        filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([2, 2, 1, 1])
 
         with filter_col1:
             people_in_pairs = sorted(set(
@@ -1269,6 +1484,26 @@ elif page == "🕸️ Social Network":
                 help="Only show edges with at least this many emails",
             )
 
+        # Load external contacts (not cached — file may be new)
+        _ext_path = RESULTS_PATH / "external_contacts.csv"
+        ext_contacts = None
+        if _ext_path.exists():
+            ext_contacts = pd.read_csv(_ext_path)
+
+        show_external = False
+        with filter_col4:
+            if ext_contacts is not None and len(ext_contacts) > 0:
+                n_romantic = 0
+                if "romantic_flag" in ext_contacts.columns:
+                    n_romantic = int(ext_contacts["romantic_flag"].sum())
+                show_external = st.checkbox(
+                    f"External ({len(ext_contacts):,})",
+                    value=False,
+                    help=f"{len(ext_contacts):,} external contacts, {n_romantic} romantic-flagged. Shows as yellow diamonds.",
+                )
+            else:
+                st.caption("No external contacts found")
+
         selected = None
         if focus != "Everyone (top connected)":
             selected = focus.split("(")[1].rstrip(")")
@@ -1278,6 +1513,7 @@ elif page == "🕸️ Social Network":
             person_df, pairs_df, cluster_names, selected_person=selected,
             show_types=show_types if show_types != available_types else None,
             min_emails_filter=min_emails_filter,
+            external_df=ext_contacts if show_external else None,
         )
         components.html(html, height=670, scrolling=False)
 
@@ -1493,6 +1729,70 @@ elif page == "🔗 Relationships":
                     f"<b>{info['name']}</b> ({count} pairs) — "
                     f"{info.get('description', '')}</div>",
                     unsafe_allow_html=True
+                )
+
+        # --- Flagged outlier relationships ---
+        if "flags" in pairs_df.columns:
+            pairs_df["flags"] = pairs_df["flags"].fillna("")
+            flagged = pairs_df[pairs_df["flags"] != ""].copy()
+            if len(flagged) > 0:
+                st.markdown("---")
+                st.markdown("### Flagged Relationships")
+                st.markdown(
+                    "Rare relationship types detected by score thresholds — "
+                    "these are outliers that clustering alone would miss."
+                )
+
+                # Count per flag type
+                all_flags = []
+                for f in flagged["flags"]:
+                    all_flags.extend([x.strip() for x in f.split(",") if x.strip()])
+                flag_counts = pd.Series(all_flags).value_counts()
+
+                FLAG_COLORS = {
+                    "Romantic": "#e91e8c",
+                    "Hostile": "#e74c3c",
+                    "After-hours": "#9b59b6",
+                    "Hierarchical": "#f39c12",
+                    "High-intensity": "#e67e22",
+                }
+
+                flag_cols = st.columns(min(len(flag_counts), 5))
+                for i, (flag_name, count) in enumerate(flag_counts.items()):
+                    color = FLAG_COLORS.get(flag_name, "#555")
+                    with flag_cols[i % len(flag_cols)]:
+                        st.markdown(
+                            f"<div style='background:{color};padding:10px;border-radius:8px;"
+                            f"color:white;text-align:center'>"
+                            f"<div style='font-size:1.4em;font-weight:bold'>{count}</div>"
+                            f"<div style='font-size:0.85em'>{flag_name}</div></div>",
+                            unsafe_allow_html=True,
+                        )
+
+                # Filter by flag
+                selected_flag = st.selectbox(
+                    "Filter by flag",
+                    ["All"] + list(flag_counts.index),
+                    key="flag_filter",
+                )
+
+                if selected_flag == "All":
+                    show_flagged = flagged
+                else:
+                    show_flagged = flagged[flagged["flags"].str.contains(selected_flag)]
+
+                show_flagged = show_flagged.copy()
+                show_flagged["Person A"] = show_flagged["person_a"].apply(_short_name)
+                show_flagged["Person B"] = show_flagged["person_b"].apply(_short_name)
+
+                flag_display = ["Person A", "Person B", "flags", "avg_intimacy",
+                                "avg_warmth", "avg_sentiment", "email_count"]
+                available = [c for c in flag_display if c in show_flagged.columns]
+                st.dataframe(
+                    show_flagged[available]
+                    .sort_values("flags")
+                    .reset_index(drop=True),
+                    width="stretch",
                 )
 
         # Filter by cluster

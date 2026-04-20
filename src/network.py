@@ -56,16 +56,16 @@ def compute_network_features(graph: nx.DiGraph) -> pd.DataFrame:
     # Number of unique people who emailed this person (in-degree)
     in_degree = dict(graph.in_degree())
 
-    # Betweenness centrality: how often does this person sit on the
-    # shortest path between two others? High = Gatekeeper
-    betweenness = nx.betweenness_centrality(undirected, normalized=True)
+    # Betweenness centrality — use approximation for large graphs
+    n_nodes = undirected.number_of_nodes()
+    if n_nodes > 500:
+        k_sample = min(200, n_nodes)
+        print(f"  Large graph ({n_nodes} nodes) — approximate betweenness (k={k_sample})")
+        betweenness = nx.betweenness_centrality(undirected, normalized=True, k=k_sample)
+    else:
+        betweenness = nx.betweenness_centrality(undirected, normalized=True)
 
-    # Clustering coefficient: how tightly connected are this person's
-    # contacts to each other? High = tight inner circle
     clustering = nx.clustering(undirected)
-
-    # PageRank: similar to Google's algorithm — who is emailed by
-    # important people?
     pagerank = nx.pagerank(graph, alpha=0.85)
 
     people = list(graph.nodes())
@@ -211,18 +211,39 @@ def save_results(features_df: pd.DataFrame, communities: dict,
     print(f"Network results saved to {output_dir}")
 
 
-def run_network_analysis(df: pd.DataFrame, output_dir: str = "data/results"):
+def run_network_analysis(df: pd.DataFrame, output_dir: str = "data/results",
+                         exec_addresses: set = None):
     """
     Full pipeline: emails → graph → features → classes → plot → save.
-    Call this from main.py.
+    exec_addresses: set of executive email addresses (people with mailboxes).
+    Non-executive @enron.com people are classified as "Employee".
     """
     print("\n=== Analysis 1 & 2: Social Network ===")
     graph = build_graph(df)
     features_df = compute_network_features(graph)
-    features_df = classify_person(features_df)
     communities = detect_communities(graph)
-
     features_df["community"] = features_df["person"].map(communities)
+
+    # Classify roles: only among executives (they have full mailboxes)
+    # Everyone else is "Employee"
+    if exec_addresses:
+        features_df["is_executive"] = features_df["person"].isin(exec_addresses)
+        n_exec = features_df["is_executive"].sum()
+        n_emp = (~features_df["is_executive"]).sum()
+        print(f"  {n_exec} executives, {n_emp} employees")
+
+        # Classify only executives using their own percentiles
+        exec_mask = features_df["is_executive"]
+        exec_df = features_df[exec_mask].copy()
+        exec_df = classify_person(exec_df)
+
+        # All non-executives are "Employee"
+        features_df["person_class"] = "Employee"
+        # Use .values to avoid index alignment issues
+        features_df.loc[exec_mask, "person_class"] = exec_df["person_class"].values
+    else:
+        features_df["is_executive"] = True
+        features_df = classify_person(features_df)
 
     plot_network(graph, features_df,
                  output_path=f"{output_dir}/network_plot.png")
