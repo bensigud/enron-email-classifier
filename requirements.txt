@@ -1,8 +1,11 @@
 pandas
+pyarrow
 scikit-learn
 nltk
 networkx
 matplotlib
+seaborn
+scipy
 streamlit
 pyvis
 anthropic

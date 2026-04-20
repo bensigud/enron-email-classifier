@@ -4,59 +4,144 @@ from dotenv import load_dotenv
 
 load_dotenv()
 import pandas as pd
+import asyncio
+import re as _re
 from pathlib import Path
 
 
 client = anthropic.Anthropic()
+async_client = anthropic.AsyncAnthropic()
 
 MODEL = "claude-sonnet-4-6"
 
 # How many emails we send to Claude for labeling
 LABEL_SAMPLE_SIZE = 500
 
+# Batch config: emails per prompt × parallel requests
+EMAILS_PER_BATCH = 10
+MAX_CONCURRENT = 15
 
-def label_email(email_text: str) -> dict:
-    """
-    Ask Claude to rate a single email on two scales:
-      - Intimacy (1-5): how personal/private is the content?
-        1=formal business, 2=mostly work, 3=mixed, 4=personal, 5=deeply personal/romantic
-      - Warmth (1-5): how warm/supportive is the tone?
-        1=hostile/cold, 2=curt/distant, 3=neutral, 4=friendly/warm, 5=loving/intimate
+BATCH_PROMPT_TEMPLATE = """You are analyzing internal corporate emails from Enron Corporation.
 
-    These two scales map to Gilbert & Karahalios (2009) dimensions:
-    - Intimacy → "Intimacy" dimension (32.8% predictive contribution)
-    - Warmth → "Emotional support" dimension
+Rate EACH email below on two scales:
 
-    We send the first 800 characters to give Claude enough context.
-    Returns {"intimacy": int, "warmth": int}
-    """
-    if not isinstance(email_text, str) or not email_text.strip():
-        return {"intimacy": 1, "warmth": 3}
-
-    snippet = email_text[:800].strip()
-
-    prompt = f"""You are analyzing internal corporate emails from Enron Corporation.
-
-Rate this email on two scales:
-
-INTIMACY (how personal/private is the content?):
-1 = Formal business (reports, contracts, scheduling)
+SELF-DISCLOSURE (does the sender share personal information, feelings, or experiences?):
+1 = Formal business only (reports, contracts, scheduling)
 2 = Mostly work with slight personal touch
 3 = Mixed work and personal content
-4 = Mostly personal (social plans, personal news)
-5 = Deeply personal or romantic (intimate feelings, love, private matters)
+4 = Mostly personal (social plans, personal news, feelings)
+5 = Deeply personal (intimate feelings, private matters, vulnerability)
 
-WARMTH (how warm/supportive is the tone?):
+RESPONSIVENESS (does the sender show understanding, validation, or caring toward the recipient?):
 1 = Hostile, angry, or threatening
 2 = Curt, cold, or distant
 3 = Neutral, professional tone
 4 = Friendly, warm, supportive
-5 = Loving, intimate, deeply caring
+5 = Deeply caring, validating, emotionally attuned
 
-Email text:
-\"\"\"{snippet}\"\"\"
+{emails_block}
 
-Reply with ONLY two numbers separated by a comma. Example: 2,4"""
+Reply with ONLY one line per email, in order: two numbers separated by a comma.
+Example reply for 3 emails:
+2,4
+1,3
+3,5"""
+
+
+def _build_emails_block(texts: list) -> str:
+    """Format multiple emails into a numbered block for the prompt."""
+    parts = []
+    for i, text in enumerate(texts, 1):
+        snippet = (text[:600].strip() if isinstance(text, str) else "(empty)")
+        parts.append(f"--- EMAIL {i} ---\n{snippet}")
+    return "\n\n".join(parts)
+
+
+def _parse_batch_response(text: str, n_expected: int) -> list:
+    """Parse multi-line response like '2,4\\n1,3\\n3,5' into list of dicts."""
+    results = []
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+
+    for line in lines:
+        # Extract first pair of numbers from the line
+        match = _re.search(r"(\d)\s*[,]\s*(\d)", line)
+        if match:
+            intimacy = max(1, min(5, int(match.group(1))))
+            warmth = max(1, min(5, int(match.group(2))))
+            results.append({"intimacy": intimacy, "warmth": warmth})
+
+    # Pad with defaults if Claude returned fewer lines
+    while len(results) < n_expected:
+        results.append({"intimacy": 1, "warmth": 3})
+
+    return results[:n_expected]
+
+
+async def _label_batch_async(texts: list, semaphore: asyncio.Semaphore) -> list:
+    """Label a batch of emails with one async API call."""
+    async with semaphore:
+        emails_block = _build_emails_block(texts)
+        prompt = BATCH_PROMPT_TEMPLATE.format(emails_block=emails_block)
+
+        try:
+            response = await async_client.messages.create(
+                model=MODEL,
+                max_tokens=5 * len(texts),
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return _parse_batch_response(response.content[0].text, len(texts))
+        except Exception as e:
+            print(f"    Batch failed: {e}")
+            return [{"intimacy": 1, "warmth": 3}] * len(texts)
+
+
+async def _label_all_async(texts: list) -> list:
+    """Label all texts using batched async requests."""
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+    # Split into batches
+    batches = []
+    for i in range(0, len(texts), EMAILS_PER_BATCH):
+        batches.append(texts[i:i + EMAILS_PER_BATCH])
+
+    total_batches = len(batches)
+    print(f"  {len(texts)} emails → {total_batches} batches "
+          f"({EMAILS_PER_BATCH}/batch, {MAX_CONCURRENT} parallel)")
+
+    # Run all batches with progress
+    all_results = []
+    done = 0
+
+    # Process in waves to show progress
+    wave_size = MAX_CONCURRENT
+    for wave_start in range(0, len(batches), wave_size):
+        wave = batches[wave_start:wave_start + wave_size]
+        tasks = [_label_batch_async(batch, semaphore) for batch in wave]
+        wave_results = await asyncio.gather(*tasks)
+
+        for batch_result in wave_results:
+            all_results.extend(batch_result)
+            done += 1
+
+        labeled_so_far = len(all_results)
+        print(f"    Labeled {labeled_so_far}/{len(texts)} emails "
+              f"({done}/{total_batches} batches)", flush=True)
+
+    return all_results
+
+
+def label_email(email_text: str) -> dict:
+    """
+    Label a single email (fallback for small batches).
+    Grounded in Reis & Shaver's Interpersonal Process Model of Intimacy (1988).
+    """
+    if not isinstance(email_text, str) or not email_text.strip():
+        return {"intimacy": 1, "warmth": 3}
+
+    results = _parse_batch_response("", 0)
+    texts = [email_text]
+    block = _build_emails_block(texts)
+    prompt = BATCH_PROMPT_TEMPLATE.format(emails_block=block)
 
     response = client.messages.create(
         model=MODEL,
@@ -64,44 +149,26 @@ Reply with ONLY two numbers separated by a comma. Example: 2,4"""
         messages=[{"role": "user", "content": prompt}]
     )
 
-    text = response.content[0].text.strip()
-
-    # Parse the response
-    try:
-        parts = text.replace(" ", "").split(",")
-        intimacy = int(parts[0])
-        warmth = int(parts[1])
-        # Clamp to valid range
-        intimacy = max(1, min(5, intimacy))
-        warmth = max(1, min(5, warmth))
-        return {"intimacy": intimacy, "warmth": warmth}
-    except (ValueError, IndexError):
-        return {"intimacy": 1, "warmth": 3}
+    parsed = _parse_batch_response(response.content[0].text, 1)
+    return parsed[0]
 
 
 def label_email_batch(df: pd.DataFrame,
                       sample_size: int = LABEL_SAMPLE_SIZE) -> pd.DataFrame:
     """
-    Take a random sample of emails, send each one to Claude to rate
-    on intimacy and warmth scales, and return a DataFrame with labels added.
+    Take a random sample of emails, send them to Claude in batches
+    with async parallelism for ~20x speedup over sequential calls.
     """
     print(f"Sending {sample_size} emails to Claude for labeling...")
 
     sample = df.sample(n=min(sample_size, len(df)), random_state=42).copy()
+    texts = sample["body"].tolist()
 
-    intimacy_labels = []
-    warmth_labels = []
+    # Run async batch labeling
+    results = asyncio.run(_label_all_async(texts))
 
-    for i, (_, row) in enumerate(sample.iterrows()):
-        if i % 50 == 0:
-            print(f"  Labeled {i}/{len(sample)} emails...")
-
-        result = label_email(row["body"])
-        intimacy_labels.append(result["intimacy"])
-        warmth_labels.append(result["warmth"])
-
-    sample["intimacy_label"] = intimacy_labels
-    sample["warmth_label"] = warmth_labels
+    sample["intimacy_label"] = [r["intimacy"] for r in results]
+    sample["warmth_label"] = [r["warmth"] for r in results]
 
     print(f"Labeling complete.")
     print(f"  Intimacy distribution:\n{sample['intimacy_label'].value_counts().sort_index().to_string()}")

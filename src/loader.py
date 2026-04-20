@@ -24,6 +24,7 @@ def _parse_file(file_path: Path) -> dict:
             "message_id": msg.get("Message-ID", str(file_path)).strip(),
             "sender":     _clean_email(sender),
             "recipients": _parse_recipients(msg.get("To", "")),
+            "cc":         _parse_recipients(msg.get("Cc", "") or msg.get("CC", "")),
             "date":       msg.get("Date", ""),
             "subject":    msg.get("Subject", "").strip(),
             "body":       clean_text(body),
@@ -67,6 +68,18 @@ def load_emails(data_path: str, max_emails: int = None) -> pd.DataFrame:
     # Parse dates
     df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
 
+    # Filter junk emails (auto-replies, newsletters, data dumps)
+    before = len(df)
+    df = df[~df.apply(lambda r: is_junk_email(r["subject"], r["body"]), axis=1)]
+    removed = before - len(df)
+    print(f"  Junk filter removed {removed:,} emails ({removed/before*100:.1f}%)")
+
+    # Deduplicate near-identical emails
+    before_dedup = len(df)
+    df = deduplicate_emails(df)
+    dedup_removed = before_dedup - len(df)
+    print(f"  Dedup removed {dedup_removed:,} near-duplicate emails ({dedup_removed/max(before_dedup,1)*100:.1f}%)")
+
     print(f"\nDone! Loaded {len(df):,} emails")
     return df
 
@@ -98,13 +111,126 @@ def _parse_recipients(recipients_str: str) -> list:
 
 
 def clean_text(text: str) -> str:
+    """
+    Clean an email body: remove quoted replies, forwarded content,
+    headers, and URLs. Only keep the original message the sender wrote.
+    """
     if not text:
         return ""
-    text = re.sub(r"-{3,}.*?(Original Message|Forwarded by).*?\n", "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    # Cut everything after common reply/forward markers
+    # These indicate the start of quoted previous messages
+    cut_patterns = [
+        r"-{3,}\s*Original Message\s*-{3,}",
+        r"-{3,}\s*Forwarded by\s",
+        r"_{3,}\s*\n",                        # _____ separator lines
+        r"={3,}\s*\n",                        # ===== separator lines
+        r"^On .+ wrote:\s*$",                 # "On Mon, Jan 1, X wrote:"
+        r"^>.*$(\n^>.*$)+",                   # Lines starting with >
+        r"^From:.*\nSent:.*\nTo:",            # Outlook-style quoted headers
+    ]
+    for pattern in cut_patterns:
+        match = re.search(pattern, text, flags=re.MULTILINE | re.IGNORECASE)
+        if match:
+            text = text[:match.start()]
+
+    # Remove stray header lines that survived
     text = re.sub(r"^(From|To|Cc|Subject|Date|Sent):.*$", "", text, flags=re.MULTILINE | re.IGNORECASE)
+    # Remove URLs
     text = re.sub(r"http\S+", "", text)
+    # Collapse excessive whitespace
     text = re.sub(r"\n{3,}", "\n\n", text)
+
     return text.strip()
+
+
+def deduplicate_emails(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove near-duplicate emails. Two emails are duplicates if they
+    have the same sender, same first recipient, and the first 100
+    characters of the body match. Keeps the earliest copy.
+
+    This catches the common Enron pattern where the same email appears
+    in both the sender's "sent" folder and the recipient's inbox, or
+    where a forwarded chain duplicates the original message.
+    """
+    df = df.sort_values("date").copy()
+
+    # Build a fingerprint from sender + first recipient + body start
+    def _fingerprint(row):
+        sender = row["sender"] or ""
+        recip = row["recipients"][0] if isinstance(row["recipients"], list) and row["recipients"] else ""
+        body = (row["body"] or "")[:100].strip().lower()
+        # Normalize whitespace for matching
+        body = re.sub(r"\s+", " ", body)
+        return f"{sender}|{recip}|{body}"
+
+    df["_fingerprint"] = df.apply(_fingerprint, axis=1)
+    df = df.drop_duplicates(subset="_fingerprint", keep="first")
+    df = df.drop(columns="_fingerprint")
+
+    return df
+
+
+def is_junk_email(subject: str, body: str) -> bool:
+    """
+    Light spam/junk filter to remove emails with no relationship signal.
+    Returns True if the email should be excluded.
+    """
+    subj = (subject or "").lower().strip()
+    text = (body or "").strip()
+
+    # Too short to carry any signal
+    if len(text) < 30:
+        return True
+
+    # Automated system messages
+    auto_patterns = [
+        r"out of office",
+        r"automatic reply",
+        r"auto.?reply",
+        r"delivery failure",
+        r"undeliverable",
+        r"returned mail",
+        r"mail delivery",
+        r"postmaster",
+        r"do not reply",
+        r"noreply",
+        r"system administrator",
+        r"virus alert",
+        r"server notification",
+    ]
+    combined = subj + " " + text[:200].lower()
+    for pattern in auto_patterns:
+        if re.search(pattern, combined):
+            return True
+
+    # Newsletters / mass distribution
+    newsletter_patterns = [
+        r"unsubscribe",
+        r"click here to",
+        r"this message was sent to",
+        r"to be removed from",
+        r"mailing list",
+        r"daily news",
+        r"weekly report",
+        r"energy bulletin",
+    ]
+    for pattern in newsletter_patterns:
+        if re.search(pattern, text.lower()):
+            return True
+
+    # Body is mostly forwarded headers / no original content
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return True
+
+    # Mostly non-alpha characters (tables, data dumps, legal text)
+    alpha_chars = sum(1 for c in text if c.isalpha())
+    if len(text) > 50 and alpha_chars / len(text) < 0.3:
+        return True
+
+    return False
 
 
 def get_executive_addresses(data_path: str) -> set:
@@ -194,15 +320,23 @@ def filter_executives_only(df: pd.DataFrame, data_path: str) -> pd.DataFrame:
 
 
 def save_processed(df: pd.DataFrame, output_path: str):
-    output_path = Path(output_path)
+    output_path = Path(output_path).with_suffix(".parquet")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output_path, index=False)
-    print(f"Saved {len(df):,} emails to {output_path}")
+    df.to_parquet(output_path, index=False, engine="pyarrow")
+    print(f"Saved {len(df):,} emails to {output_path} "
+          f"({output_path.stat().st_size / 1024 / 1024:.1f} MB)")
 
 
 def load_processed(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
+    import time
+    path = Path(path).with_suffix(".parquet")
+    t0 = time.time()
+    df = pd.read_parquet(path, engine="pyarrow")
     df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-    df["recipients"] = df["recipients"].apply(ast.literal_eval)
-    print(f"Loaded {len(df):,} emails from {path}")
+    if "recipients" in df.columns and len(df) > 0:
+        first = df["recipients"].iloc[0]
+        if isinstance(first, str):
+            df["recipients"] = df["recipients"].apply(ast.literal_eval)
+    elapsed = time.time() - t0
+    print(f"Loaded {len(df):,} emails from {path.name} ({elapsed:.1f}s)")
     return df

@@ -3,9 +3,10 @@ Stage 3 — Unsupervised Clustering
 
 Takes the pair feature vectors from Stage 2 and discovers natural
 relationship groupings using:
-  - K-Means (trying K=3..7, picking best by silhouette score)
-  - DBSCAN (finds number of clusters automatically)
-  - Compares both methods
+  - GMM (soft clustering — each pair gets a probability per cluster)
+  - K-Means (hard clustering — for comparison)
+  - DBSCAN (density-based — finds outliers)
+  - Compares all methods by silhouette score, prefers GMM for soft labels
 """
 
 import json
@@ -15,7 +16,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans, DBSCAN
-from sklearn.metrics import silhouette_score
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 
 from src.stage2 import FEATURE_COLS
 
@@ -24,6 +26,9 @@ def cluster_relationships(pair_features_df: pd.DataFrame,
                           output_dir: str) -> pd.DataFrame:
     """
     Run unsupervised clustering on pair feature vectors.
+    Uses GMM (soft), K-Means (hard), and DBSCAN (density).
+    GMM is preferred because it gives probabilities per cluster,
+    allowing relationships to have mixed types.
     """
     print("  Clustering relationships...")
 
@@ -32,7 +37,25 @@ def cluster_relationships(pair_features_df: pd.DataFrame,
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # --- K-Means ---
+    # --- GMM (soft clustering) ---
+    gmm_scores = {}
+    gmm_models = {}
+    for k in range(3, 8):
+        gmm = GaussianMixture(
+            n_components=k, random_state=42, n_init=5, covariance_type="full"
+        )
+        gmm.fit(X_scaled)
+        labels = gmm.predict(X_scaled)
+        score = silhouette_score(X_scaled, labels)
+        gmm_scores[k] = score
+        gmm_models[k] = gmm
+        print(f"    GMM K={k}: silhouette={score:.3f}, BIC={gmm.bic(X_scaled):.0f}")
+
+    best_gmm_k = max(gmm_scores, key=gmm_scores.get)
+    best_gmm_score = gmm_scores[best_gmm_k]
+    print(f"    Best GMM: K={best_gmm_k} (silhouette={best_gmm_score:.3f})")
+
+    # --- K-Means (hard clustering, for comparison) ---
     kmeans_scores = {}
     kmeans_models = {}
     for k in range(3, 8):
@@ -43,9 +66,9 @@ def cluster_relationships(pair_features_df: pd.DataFrame,
         kmeans_models[k] = (km, labels)
         print(f"    K-Means K={k}: silhouette={score:.3f}")
 
-    best_k = max(kmeans_scores, key=kmeans_scores.get)
-    best_km_score = kmeans_scores[best_k]
-    print(f"    Best K-Means: K={best_k} (silhouette={best_km_score:.3f})")
+    best_km_k = max(kmeans_scores, key=kmeans_scores.get)
+    best_km_score = kmeans_scores[best_km_k]
+    print(f"    Best K-Means: K={best_km_k} (silhouette={best_km_score:.3f})")
 
     # --- DBSCAN ---
     dbscan_scores = {}
@@ -64,43 +87,104 @@ def cluster_relationships(pair_features_df: pd.DataFrame,
                 print(f"    DBSCAN eps={eps}: {n_clusters} clusters, "
                       f"{n_noise} outliers, silhouette={score:.3f}")
 
-    # --- Pick best ---
-    best_method = "kmeans"
-    best_labels = kmeans_models[best_k][1]
-    best_score = best_km_score
-
+    # --- Pick best method ---
+    # Prefer GMM if its silhouette is competitive (within 0.05 of best),
+    # because soft labels are more informative
+    all_scores = {"gmm": best_gmm_score, "kmeans": best_km_score}
     if dbscan_scores:
         best_eps = max(dbscan_scores, key=dbscan_scores.get)
-        if dbscan_scores[best_eps] > best_km_score:
-            best_method = "dbscan"
-            best_labels = dbscan_models[best_eps][1]
-            best_score = dbscan_scores[best_eps]
-            print(f"\n    Best method: DBSCAN eps={best_eps} "
-                  f"(silhouette={best_score:.3f})")
-        else:
-            print(f"\n    Best method: K-Means K={best_k} "
-                  f"(silhouette={best_score:.3f})")
-    else:
-        print(f"\n    Best method: K-Means K={best_k} "
+        db_labels = dbscan_models[best_eps][1]
+        outlier_ratio = (db_labels == -1).sum() / len(db_labels)
+        if outlier_ratio <= 0.5:
+            all_scores["dbscan"] = dbscan_scores[best_eps]
+
+    overall_best = max(all_scores, key=all_scores.get)
+    best_hard_score = all_scores[overall_best]
+
+    # Use GMM if it's within 0.05 of the best hard method
+    if best_gmm_score >= best_hard_score - 0.05:
+        best_method = "gmm"
+        best_gmm = gmm_models[best_gmm_k]
+        best_labels = best_gmm.predict(X_scaled)
+        best_score = best_gmm_score
+        print(f"\n    Selected: GMM K={best_gmm_k} "
+              f"(silhouette={best_score:.3f}, soft labels)")
+    elif overall_best == "dbscan":
+        best_method = "dbscan"
+        best_labels = dbscan_models[best_eps][1]
+        best_score = dbscan_scores[best_eps]
+        print(f"\n    Selected: DBSCAN eps={best_eps} "
               f"(silhouette={best_score:.3f})")
-        print("    (DBSCAN did not find valid clusters)")
+    else:
+        best_method = "kmeans"
+        best_labels = kmeans_models[best_km_k][1]
+        best_score = best_km_score
+        print(f"\n    Selected: K-Means K={best_km_k} "
+              f"(silhouette={best_score:.3f})")
+
+    # --- Additional clustering metrics ---
+    valid_mask = best_labels != -1
+    if valid_mask.sum() > 0 and len(set(best_labels[valid_mask])) >= 2:
+        db_score = davies_bouldin_score(X_scaled[valid_mask], best_labels[valid_mask])
+        ch_score = calinski_harabasz_score(X_scaled[valid_mask], best_labels[valid_mask])
+        print(f"\n    Clustering quality metrics:")
+        print(f"      Silhouette:        {best_score:.3f}  (higher is better, range -1 to 1)")
+        print(f"      Davies-Bouldin:    {db_score:.3f}  (lower is better)")
+        print(f"      Calinski-Harabasz: {ch_score:.1f}  (higher is better)")
+    else:
+        db_score = None
+        ch_score = None
 
     pair_features_df = pair_features_df.copy()
     pair_features_df["cluster"] = best_labels
 
+    # --- Save soft probabilities if GMM was used ---
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    if best_method == "gmm":
+        probas = best_gmm.predict_proba(X_scaled)
+        proba_df = pd.DataFrame(
+            probas,
+            columns=[f"cluster_{i}_prob" for i in range(best_gmm_k)],
+        )
+        # Add pair identifiers
+        proba_df["person_a"] = pair_features_df["person_a"].values
+        proba_df["person_b"] = pair_features_df["person_b"].values
+        proba_df["primary_cluster"] = best_labels
+
+        # Secondary cluster: second-highest probability
+        proba_cols = [f"cluster_{i}_prob" for i in range(best_gmm_k)]
+        proba_vals = probas.copy()
+        # Zero out the primary to find secondary
+        for idx in range(len(proba_vals)):
+            proba_vals[idx, best_labels[idx]] = 0
+        pair_features_df["secondary_cluster"] = proba_vals.argmax(axis=1)
+        pair_features_df["primary_prob"] = probas[
+            np.arange(len(probas)), best_labels
+        ].round(3)
+        pair_features_df["secondary_prob"] = proba_vals.max(axis=1).round(3)
+
+        proba_df.to_csv(out / "cluster_probabilities.csv", index=False)
+
+        # Report mixed-type pairs
+        mixed_mask = pair_features_df["secondary_prob"] >= 0.25
+        n_mixed = mixed_mask.sum()
+        print(f"\n    Mixed-type pairs (secondary >= 25%): "
+              f"{n_mixed} ({n_mixed/len(pair_features_df)*100:.1f}%)")
+
     # Save plots and metadata
-    _plot_silhouette_scores(kmeans_scores, output_dir)
+    _plot_silhouette_scores(kmeans_scores, gmm_scores, output_dir)
     _plot_cluster_distribution(pair_features_df, output_dir)
 
     # Cluster profiles
     valid = pair_features_df[pair_features_df["cluster"] != -1]
-    profiles = valid.groupby("cluster")[FEATURE_COLS].mean().round(4)
+    available_feat_cols = [c for c in FEATURE_COLS if c in valid.columns]
+    profiles = valid.groupby("cluster")[available_feat_cols].mean().round(4)
     profiles["pair_count"] = valid.groupby("cluster").size()
 
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
     profiles.to_csv(out / "cluster_profiles.csv")
-    _plot_cluster_heatmap(profiles[FEATURE_COLS], output_dir)
+    _plot_cluster_heatmap(profiles[available_feat_cols], output_dir)
 
     print("\n    Cluster profiles:")
     summary_cols = ["avg_intimacy", "avg_warmth", "avg_sentiment",
@@ -112,24 +196,35 @@ def cluster_relationships(pair_features_df: pd.DataFrame,
     meta = {
         "best_method": best_method,
         "best_score": best_score,
+        "davies_bouldin": round(db_score, 3) if db_score is not None else None,
+        "calinski_harabasz": round(ch_score, 1) if ch_score is not None else None,
         "kmeans_scores": {str(k): v for k, v in kmeans_scores.items()},
+        "gmm_scores": {str(k): v for k, v in gmm_scores.items()},
         "dbscan_scores": {str(k): v for k, v in dbscan_scores.items()},
     }
-    if best_method == "kmeans":
-        meta["best_k"] = best_k
+    if best_method == "gmm":
+        meta["best_k"] = best_gmm_k
+        meta["n_mixed_pairs"] = int(n_mixed)
+    elif best_method == "kmeans":
+        meta["best_k"] = best_km_k
     with open(out / "clustering_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
     return pair_features_df
 
 
-def _plot_silhouette_scores(kmeans_scores, output_dir):
+def _plot_silhouette_scores(kmeans_scores, gmm_scores, output_dir):
     fig, ax = plt.subplots(figsize=(8, 5))
     ks = list(kmeans_scores.keys())
-    scores = list(kmeans_scores.values())
-    ax.plot(ks, scores, "o-", label="K-Means", color="#3498db")
-    best_k = max(kmeans_scores, key=kmeans_scores.get)
-    ax.axvline(x=best_k, color="#3498db", linestyle="--", alpha=0.5)
+
+    ax.plot(ks, [kmeans_scores[k] for k in ks], "o-",
+            label="K-Means", color="#3498db")
+    ax.plot(ks, [gmm_scores[k] for k in ks], "s-",
+            label="GMM (soft)", color="#e74c3c")
+
+    best_gmm_k = max(gmm_scores, key=gmm_scores.get)
+    ax.axvline(x=best_gmm_k, color="#e74c3c", linestyle="--", alpha=0.4)
+
     ax.set_xlabel("Number of Clusters (K)")
     ax.set_ylabel("Silhouette Score")
     ax.set_title("Silhouette Score vs Number of Clusters", fontsize=13)

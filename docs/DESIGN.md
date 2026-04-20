@@ -89,11 +89,13 @@ Raw emails (data/raw/maildir/)
         |                    - Train 2 ML classifiers (LogReg vs SVM vs RF)
         |                    - Apply to all emails --> intimacy_score + warmth_score
         |                    - VADER sentiment     --> sentiment_score
+        |                    - Reports score correlations
         |
-        ├── stage2.py    --> pair-level feature vectors (20 features)
+        ├── stage2.py    --> pair-level feature vectors (27 features)
         |                    - Aggregate Stage 1 scores per pair
-        |                    - Add email patterns (count, duration, direction)
-        |                    - Add network features (community, degree, pagerank)
+        |                    - Add email patterns (count, frequency, duration, direction)
+        |                    - Add network features (community, shared neighbors, degree, pagerank)
+        |                    - Add variance features (stability of communication)
         |
         ├── stage3.py    --> unsupervised clustering
         |                    - Standardize features
@@ -177,22 +179,28 @@ def filter_executives_only(df, data_path) -> pd.DataFrame
 | `warmth_score` | ML classifier trained on Claude labels | Emotional support | 0.0 – 1.0 |
 | `sentiment_score` | VADER | Emotional support (backup) | -1.0 – +1.0 |
 
-**How the ML classifiers work:**
+**How the ML models work (hybrid approach):**
 
 1. **Labeling:** Claude API labels 500 random emails on two scales (one API call per email, both scales rated in the same call):
    - Intimacy (1-5): 1=formal business, 5=deeply personal/romantic
    - Warmth (1-5): 1=hostile/cold, 5=loving/supportive
-2. **Training:** For each scale, we convert labels to binary (1-2 = low, 4-5 = high, 3 = excluded) and train three classifiers using TF-IDF features:
-   - Logistic Regression
-   - Support Vector Machine (SVM)
-   - Random Forest
-3. **Evaluation:** 5-fold cross-validation, precision/recall/F1, confusion matrices. Best model selected per scale.
-4. **Prediction:** Best model scores all emails using `predict_proba` for continuous scores.
+2. **Intimacy — Classification:** Labels converted to binary (1-2 = low, 3-5 = high). Three classifiers compared using TF-IDF features:
+   - Logistic Regression, SVM, Random Forest
+   - Evaluation: 5-fold CV, precision/recall/F1, confusion matrix
+   - Scoring: `predict_proba` for continuous scores (0.0–1.0)
+3. **Warmth — Regression:** Uses raw 1-5 labels directly (no binarization). Three regressors compared:
+   - Ridge Regression, SVR, Random Forest Regressor
+   - Evaluation: 5-fold CV, R², MAE, RMSE, predicted-vs-actual scatter plot
+   - Scoring: predicted value normalized from 1-5 scale to 0.0–1.0
 
-**Why two ML classifiers + VADER?**
+**Why classification for intimacy but regression for warmth?**
+- Intimacy splits cleanly into binary (formal vs personal) with good class balance
+- Warmth is problematic as a binary task because most corporate emails are neutral (warmth=3). Binarizing either throws away data (excluding 3s) or creates extreme class imbalance (lumping 3s with low). Regression uses all 500 labeled samples and preserves the ordinal structure.
+
+**Why three scoring methods?**
 - Intimacy measures **what** they share (personal topics vs work topics)
 - Warmth measures **how** they relate (hostile vs supportive vs loving)
-- Sentiment (VADER) provides an independent backup signal for emotional tone
+- Sentiment (VADER) provides an independent, rule-based signal for emotional tone
 - These are independent dimensions — a personal email can be warm ("I miss you") or cold ("I can't believe you did that")
 
 **Key functions:**
@@ -209,7 +217,7 @@ def run_stage1(df, output_dir) -> pd.DataFrame
 
 **What it does:** For every pair of executives who exchanged enough emails, builds a feature vector from Stage 1 scores + email patterns + network features. These features map to 6 of Gilbert's 7 dimensions.
 
-**Feature vector per pair (20 features):**
+**Feature vector per pair (27 features):**
 
 *Intimacy dimension (Gilbert #1) — from Stage 1:*
 
@@ -228,7 +236,12 @@ def run_stage1(df, output_dir) -> pd.DataFrame
 | `warmth_a_to_b` | How warmly A writes to B |
 | `warmth_b_to_a` | How warmly B writes to A |
 | `warmth_imbalance` | Is warmth one-sided? |
-| `avg_sentiment` | VADER sentiment (backup emotional signal) |
+
+*Sentiment — independent VADER signal:*
+
+| Feature | What it captures |
+|---|---|
+| `avg_sentiment` | VADER sentiment (independent tone signal, -1 to +1) |
 
 *Intensity dimension (Gilbert #2) — from email patterns:*
 
@@ -236,6 +249,9 @@ def run_stage1(df, output_dir) -> pd.DataFrame
 |---|---|
 | `email_count` | How much they communicate |
 | `direction_ratio` | Balanced (0.5) vs one-sided (1.0) |
+| `emails_per_month` | Communication frequency independent of total count |
+| `after_hours_ratio` | Fraction of emails sent evenings/weekends (personal signal) |
+| `direct_ratio` | Fraction sent directly (TO:) vs CC'd (intentional contact) |
 
 *Duration dimension (Gilbert #3) — from timestamps:*
 
@@ -248,6 +264,7 @@ def run_stage1(df, output_dir) -> pd.DataFrame
 | Feature | What it captures |
 |---|---|
 | `same_community` | Are they in the same cluster? (1 or 0) |
+| `shared_neighbors` | How many people do both A and B email? |
 
 *Social distance dimension (Gilbert #6) — from network:*
 
@@ -266,23 +283,33 @@ def run_stage1(df, output_dir) -> pd.DataFrame
 | `warmth_std` | Is warmth consistent or volatile? |
 | `sentiment_std` | Is sentiment consistent or volatile? |
 
+*Language style matching — Niederhoffer & Pennebaker (2002):*
+
+| Feature | What it captures |
+|---|---|
+| `style_similarity` | Overall writing style similarity (0=different, 1=identical) |
+| `formality_diff` | Greeting formality difference (casual vs formal) |
+| `pronoun_rate_diff` | Difference in pronoun usage (proxy for informality match) |
+
 **Key functions:**
 ```python
-def build_pair_features(df, person_features_df) -> pd.DataFrame
-def run_stage2(df, person_features_df, output_dir) -> pd.DataFrame
+def build_pair_features(df, person_features_df, graph) -> pd.DataFrame
+def run_stage2(df, person_features_df, output_dir, graph) -> pd.DataFrame
 ```
 
 ---
 
 ### 5.5 `src/stage3.py` — Stage 3: Unsupervised Clustering
 
-**What it does:** Takes the 20-feature pair vectors and discovers natural groupings using unsupervised clustering.
+**What it does:** Takes the pair feature vectors and discovers natural groupings using unsupervised clustering. Uses **GMM (Gaussian Mixture Model)** as the primary method because it produces **soft labels** — each pair gets a probability per cluster, allowing relationships to be a mix of types (e.g. 70% Business + 25% Mentorship).
 
 **Approach:**
 1. Standardise all features (StandardScaler) so no single feature dominates
-2. Run **K-Means** with K = 3, 4, 5, 6, 7 — pick best by silhouette score
-3. Run **DBSCAN** — it finds the number of clusters automatically
-4. Compare both methods, pick the one with better silhouette score
+2. Run **GMM** with K = 3..7 — soft clustering, each pair gets probabilities
+3. Run **K-Means** with K = 3..7 — hard clustering, for comparison
+4. Run **DBSCAN** — density-based, finds outliers automatically
+5. Compare all methods by silhouette score. Prefer GMM if its score is within 0.05 of the best hard method, because soft labels are more informative
+6. Save cluster probabilities so pairs can have mixed types
 
 **Key functions:**
 ```python
@@ -306,7 +333,7 @@ def run_stage3(pair_features_df, output_dir) -> pd.DataFrame
 
 | Type | Intimacy | Warmth | Intensity | Duration | Social distance |
 |---|---|---|---|---|---|
-| Professional | Low | Neutral | Any | Any | Any |
+| Business | Low | Neutral | Any | Any | Any |
 | Friendly | Low-med | High | Medium+ | Long | Low |
 | Close/Romantic | High | High | High | Long | Low |
 | Hostile | Any | Very low | Any | Any | Any |
