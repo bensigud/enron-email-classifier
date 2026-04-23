@@ -2,9 +2,9 @@
 ## The Social World of Enron — A Behavioral Analytics Study
 
 **Course:** RAF620M — Introduction to Machine Learning and AI
-**Team:** Atli, Benedikt, Húgó
-**Date:** 2026-03-29
-**Status:** Draft
+**Team:** Atli, Benedikt, Hugo
+**Date:** 2026-03-29 (initial), updated 2026-04-23
+**Status:** Final
 
 ---
 
@@ -24,13 +24,27 @@ This is a **behavioral analytics** project. We are not just classifying emails �
 
 ## 2. Goal
 
-Use machine learning and network analysis to map the social world inside Enron — identifying key players, uncovering relationships (professional, friendly, hostile, and romantic), and understanding how people's communication behavior differs across the organisation.
+Use machine learning and network analysis to map the social world inside Enron — identifying key players, uncovering relationship types (transactional, friendly, close, hostile, romantic), and understanding how people's communication behavior differs across the organisation.
 
 Every analysis in this project is about **people and their relationships**, not just emails.
 
 ---
 
-## 3. Social Classes
+## 3. Theoretical Foundation
+
+The project is grounded in five published research frameworks:
+
+| Framework | What it provides |
+|---|---|
+| **Reis & Shaver (1988)** — Interpersonal Process Model | Self-disclosure and responsiveness as the two pillars of relationship closeness |
+| **Ureña-Carrion, Saramäki & Kivelä (2020)** | Temporal communication features: burstiness, regularity, stability |
+| **Backstrom & Kleinberg (2014)** | Structural dispersion — how spread out two people's mutual friends are |
+| **Ireland et al. (2011)** | Language style matching as a predictor of relationship closeness |
+| **Kram & Isabella (1985) / Sias & Cahill (1998)** | Taxonomy of workplace relationship types |
+
+---
+
+## 4. Social Classes
 
 These are the classes we assign throughout the project. Every person and every relationship gets a class.
 
@@ -38,151 +52,157 @@ These are the classes we assign throughout the project. Every person and every r
 
 | Class | Description |
 |---|---|
-| **The Hub** | Emails everyone — highly connected, central to the organisation |
-| **The Gatekeeper** | Sits between two groups, controls the flow of information |
-| **The Inner Circle** | Tight cluster, emails the same small group intensely |
-| **The Follower** | Connected to powerful people but low personal influence |
-| **The Isolated** | Few connections, lives on the periphery of the organisation |
+| **Hub** | Top 10% by connections — central to the network |
+| **Gatekeeper** | Top 15% by betweenness — controls information flow between groups |
+| **Inner Circle** | High clustering + low reach — tight local group |
+| **Follower** | Average connectivity — regular executive |
+| **Isolated** | Bottom 10% by connections — peripheral |
+| **Employee** | Non-executive @enron.com person (no mailbox in dataset) |
 
-### Relationship Classes (What is the nature of each connection?)
+### Relationship Types (What is the nature of each connection?)
 
-| Class | Description |
+Discovered by unsupervised clustering and named using Kram & Isabella's (1985) workplace peer typology:
+
+| Type | Description |
 |---|---|
-| **Professional** | Formal, business-focused language |
-| **Friendly** | Warm, casual, personal but not romantic |
-| **Hostile** | Negative, tense, cold — conflict signals |
-| **Romantic** | Intimate, personal, emotional language |
-| **Mentorship** | One-directional — advice, guidance, support |
+| **Transactional** | Low disclosure, low responsiveness, neutral, surface-level exchange |
+| **Friendly Colleagues** | Moderate responsiveness, mostly work content, balanced, regular contact |
+| **Close** | High disclosure + responsiveness + stability, real trust, personal sharing |
+| **Boss-Employee** | High degree difference, skewed direction, low disclosure, top-down |
+| **Mentor** | High degree difference + senior is more responsive, supportive |
+| **Romance** | Highest disclosure + responsiveness + after-hours ratio, personal language |
+| **Tense / Conflict** | Low responsiveness, negative sentiment, volatile |
+| **Fading** | Low temporal stability, high burstiness, was active then went silent |
 
 ### What a full social profile looks like
 
 Every person in Enron ends up with a profile like:
 
-> *"Person A is a **Hub** with mostly **Professional** relationships, except with Person B where it is **Friendly** and Person C where it is **Romantic**."*
-
-These classes are the foundation of the entire project.
+> *"Person A is a **Hub** with mostly **Transactional** relationships, except with Person B where it is **Close** and Person C where it is **Romance**."*
 
 ---
 
----
+## 5. The Pipeline
 
-## 4. The 5 Analyses
+The project is built as a **4-stage ML pipeline** with a network analysis step and external contact identification:
 
-### Analysis 1 — "The Key Players"
-**Question:** Can we identify the fraudsters (Persons of Interest) purely from how they communicated — without reading a single email?
+### Stage 0 — Load & Clean
+- Parse 174,685 raw emails from 151 executive mailboxes (parallelised across CPU cores)
+- Clean email bodies: strip quoted replies, forwarded content, URLs
+- Filter junk: auto-replies, newsletters, system messages, short/non-text emails
+- Deduplicate: same email appears in sender's sent folder and recipient's inbox
+- Identify external contacts (non-@enron.com recipients) before filtering
+- Filter to 46,878 internal executive emails
 
-- Build a social network graph of who emailed whom and how often
-- Extract network features per person: number of contacts, centrality, how many people they connected, response patterns
-- Train a classifier to predict who is a Person of Interest (POI) based only on these behavioural features
+### Network Analysis — Social Graph
+- Build directed graph: nodes = people, edges = emails, weight = count
+- Compute per-person metrics: degree, betweenness centrality, clustering coefficient, PageRank
+- Classify each person into a role (Hub, Gatekeeper, Inner Circle, Follower, Isolated, Employee)
+- Detect communities using greedy modularity
 
-**What this tells us:** Fraudsters communicate differently. They may email fewer people but more intensely, or sit at unusual positions in the network.
+### Stage 1 — Email-Level Scoring
+- Claude API labels a sample of emails on two scales (self-disclosure 1-5, responsiveness 1-5)
+- Human team members label emails in the UI; their labels override Claude's
+- Train a **self-disclosure classifier** (binary: low vs high) — TF-IDF + LogReg/SVM/RF, 5-fold CV
+- Train a **responsiveness regressor** (predict 1-5) — TF-IDF + Ridge/SVR/RF, 5-fold CV
+- VADER sentiment provides an independent rule-based tone signal
+- Score all 46,878 emails with the trained models (no Claude calls in predict mode)
 
-**ML method:** Network feature extraction + Logistic Regression / Random Forest
-**Labels:** POI vs non-POI (Enron fraud dataset, Kaggle)
+### Stage 2 — Pair-Level Features
+- For every pair with 5+ emails in both directions, compute 24 features across 8 dimensions:
+  - Self-disclosure (3), Responsiveness (3), Sentiment (2), Intensity (4), Temporal patterns (3), Duration (1), Structural (3), Language style matching (3)
+- Flag outlier relationships (Romantic, Hostile, After-hours, Hierarchical) using statistical thresholds
 
----
+### Stage 3 — Unsupervised Clustering
+- Compare GMM (soft labels), K-Means (hard labels), and DBSCAN (density-based)
+- GMM preferred for soft probabilities — each pair gets a probability per cluster
+- Best K selected by BIC; method selected by silhouette score comparison
+- Quality measured by Silhouette, Davies-Bouldin, Calinski-Harabasz
 
-### Analysis 2 — "The Social Network"
-**Question:** How was everyone connected? Were there tight cliques, isolated people, bridges between groups?
-
-- Build the full email communication network for all ~150 employees
-- Detect communities/clusters (groups of people who emailed each other a lot)
-- Identify central connectors, isolated individuals, and gatekeepers
-- Visualise the full network as a graph
-
-**What this tells us:** A map of the social structure of Enron — who the real power centres were, and whether the fraud happened inside a specific cluster.
-
-**ML method:** Community detection (unsupervised graph clustering)
-**Labels:** None needed — purely unsupervised
-
----
-
-### Analysis 3 — "Friends and Enemies"
-**Question:** Were people writing warmly or coldly to each other? Can we detect friendship and hostility from email tone?
-
-- Apply sentiment analysis to emails exchanged between specific pairs of people
-- Score each relationship as positive, neutral, or negative
-- Map a "relationship sentiment graph" — who liked who, who was cold to who
-
-**What this tells us:** Beyond just who emailed who, we can see the emotional quality of those relationships. Were the fraudsters' inner circle unusually warm with each other? Were there tensions?
-
-**ML method:** Sentiment analysis per person-pair (NLTK VADER)
-**Labels:** None needed — sentiment scores computed automatically
+### Stage 4 — Cluster Interpretation
+- Compute z-scores per cluster to find distinctive features
+- Send cluster profiles + sample emails to Claude in one API call
+- Claude maps each cluster to a relationship type from Kram & Isabella (1985)
+- Team can rename clusters in the UI
 
 ---
 
-### Analysis 4 — "Office Romance"
-**Question:** Were there personal or romantic relationships hidden inside the corporate email traffic?
+## 6. Human-in-the-Loop Validation
 
-- Use Claude API to label a sample of emails as: professional / personal / romantic
-- Train a classifier on those labels
-- Apply the classifier across all emails to find personal communication patterns
-- Identify pairs of employees with unusually high personal/romantic email scores
+The Streamlit UI includes a validation system where team members:
 
-**What this tells us:** A map of the personal relationships inside Enron — who was close to who beyond the professional level.
+1. **Label emails** on the same scales as Claude (active learning — most uncertain emails shown first)
+2. **Review relationship pairs** — read emails, pick relationship type, compare to pipeline's prediction
+3. **Edit cluster names** — rename any cluster that doesn't fit
+4. **Results dashboard** — Cohen's kappa (human vs Claude, human vs human), pipeline accuracy, cluster agreement
 
-**ML method:** TF-IDF + Logistic Regression / Naive Bayes
-**Labels:** Generated using Claude API on a sample
+Human labels feed back into the pipeline on retrain — they override Claude's labels for the same emails.
 
 ---
 
-### Analysis 5 — "Communication Personality"
-**Question:** Do people have distinct communication styles? Can we cluster employees into personality types based on how they write and who they write to?
+## 7. Dataset
 
-- Extract behavioural features per person: email volume, average length, time of day sent, vocabulary richness, number of unique contacts, reply speed
-- Cluster employees into groups using unsupervised learning
-- Compare clusters against known POIs — do fraudsters cluster together?
-
-**What this tells us:** People have consistent communication personalities. This analysis shows whether there is a "fraudster type" of communicator.
-
-**ML method:** K-Means or DBSCAN clustering (unsupervised)
-**Labels:** None needed — clusters discovered automatically
+| Dataset | Source | Size |
+|---|---|---|
+| Enron Email Corpus | Carnegie Mellon University | ~500,000 raw emails |
+| After parsing & cleaning | — | 174,685 emails |
+| After filtering to internal executives | — | 46,878 emails |
+| Claude-labeled training set | — | 6,715 emails |
+| Human-labeled validation set | — | 71 emails |
 
 ---
 
-## 5. Dataset
-
-| Dataset | Source | Size | Labels |
-|---|---|---|---|
-| Enron Email Corpus | Carnegie Mellon University | ~500,000 emails | None (raw) |
-| Enron Fraud/POI Dataset | Kaggle | 146 employees | POI / non-POI |
-
-Primary dataset: **Enron Email Corpus** from CMU
-POI labels used only for Analysis 1 evaluation.
-
----
-
-## 6. Tools & Libraries
+## 8. Tools & Libraries
 
 All code written in **Python only**.
 
 | Purpose | Library |
 |---|---|
-| Data loading & manipulation | `pandas` |
+| Data loading & manipulation | `pandas`, `pyarrow` |
 | Machine learning models | `scikit-learn` |
 | Network/graph analysis | `networkx` |
 | Sentiment analysis | `nltk` (VADER) |
-| Clustering | `scikit-learn` (KMeans, DBSCAN) |
-| Visualisations | `matplotlib` |
-| Email labeling (romance) | Claude API (`anthropic`) |
-| Interactive UI | `streamlit` |
-| Claude chat assistant | `anthropic` |
+| Statistical tests | `scipy` |
+| Visualisations | `matplotlib`, `seaborn` |
+| Email labeling & cluster naming | Claude API (`anthropic`, model: `claude-sonnet-4-6`) |
+| Interactive UI | `streamlit`, `pyvis` |
 
 ---
 
-## 7. Evaluation
+## 9. Evaluation
 
-| Analysis | How We Know It Worked |
+| What we evaluate | How | Current result |
+|---|---|---|
+| Self-disclosure classifier | 5-fold CV | F1=0.51, Accuracy=0.84 |
+| Responsiveness regressor | 5-fold CV | R²=0.16, MAE=0.42 |
+| Model selection significance | Paired t-test | Not significant (p>0.05) |
+| Claude label quality | Human vs Claude labels | Cohen's kappa |
+| Inter-human agreement | Compare team members' labels | Cohen's kappa |
+| Clustering quality | GMM vs K-Means vs DBSCAN | Silhouette, Davies-Bouldin, Calinski-Harabasz |
+| Full model vs baselines | Ablation study | Silhouette drop per removed paper |
+| Pipeline accuracy | Human relationship labels vs cluster | % match |
+
+---
+
+## 10. Interactive UI
+
+A Streamlit app with 9 pages for exploring the results:
+
+| Page | What it shows |
 |---|---|
-| Key Players | Precision/Recall vs known POIs |
-| Social Network | Visual network map + community quality score |
-| Friends & Enemies | Sentiment distribution across relationships (visualised) |
-| Office Romance | Accuracy / F1 on Claude-labeled sample |
-| Communication Personality | Cluster separation score + overlap with POIs |
+| **Training** | Pipeline status, run controls, output files, reset tools |
+| **Overview** | Key numbers, model performance, comparison charts |
+| **Social Network** | Interactive pyvis graph — nodes by role, edges by relationship type, filters |
+| **Person Profile** | Select any person: stats, mini network, relationships, read their emails |
+| **Relationships** | Cluster profiles, flagged outliers, explore by type, look up any pair |
+| **Model Analysis** | PCA, correlations, feature importance, silhouette analysis, baseline comparison, timeline, distributions |
+| **Human Validation** | Email labeling, relationship review, cluster name editor, results dashboard |
+| **Run** | Full predict mode — score all emails with saved models |
+| **Ask the Data** | Claude chat — ask questions about the results in plain English |
 
 ---
 
-## 8. What This Project is NOT
+## 11. What This Project is NOT
 
 - This is not a spam filter
 - This is not a simple fraud classifier
@@ -192,60 +212,13 @@ All code written in **Python only**.
 
 ---
 
-## 9. Interactive UI & Claude Assistant
-
-A lightweight interactive app will be built alongside the analyses so the team — and the professor during the presentation — can explore the findings visually and ask questions in plain language.
-
-### UI (Streamlit)
-Built in Python using **Streamlit** — the simplest way to build a data app in pure Python.
-
-The app will have:
-- **Social network map** — interactive graph showing all employees and their connections
-- **Person profile page** — click on any employee to see their person class, relationship classes, and key stats
-- **Friends & Enemies view** — visualise sentiment between pairs of people
-- **Office Romance finder** — show pairs flagged as romantic
-- **Timeline view** — how did communication patterns change over time?
-
-### Claude Assistant (Ask the Data)
-A chat interface inside the app powered by the **Claude API** where you can ask questions in plain English about the dataset and the discoveries, for example:
-
-> *"Who was the most connected person at Enron?"*
-> *"Were there any romantic relationships involving senior executives?"*
-> *"Which employees showed the most hostile communication?"*
-> *"What does the data tell us about Ken Lay's inner circle?"*
-
-Claude will be given the analysis results as context and answer based on what the data actually shows.
-
-### Why this matters
-This UI is what will make the presentation come alive. Instead of showing static charts, you can explore the data live in front of the professor and answer their questions on the spot.
-
-**Library:** `streamlit`, `anthropic` (Claude API)
-
----
-
-## 10. Deliverables
+## 12. Deliverables
 
 | Deliverable | Location |
 |---|---|
 | This PRD | `docs/PRD.md` |
 | Technical design | `docs/DESIGN.md` |
 | Python source code | `src/` |
+| Pipeline runner | `main.py` |
 | Interactive UI | `app.py` |
-| Final report | `docs/REPORT.md` |
 | All results/plots | `data/results/` |
-
----
-
-## 10. Timeline
-
-| Task | Target Date |
-|---|---|
-| PRD complete | 2026-03-29 |
-| Design complete | 2026-03-30 |
-| Data loaded & explored | 2026-03-31 |
-| Analysis 1 & 2 coded | 2026-04-04 |
-| Analysis 3 & 4 coded | 2026-04-06 |
-| Analysis 5 coded | 2026-04-07 |
-| Results & visualisations | 2026-04-08 |
-| Final report written | 2026-04-10 |
-| Presentation | ~2026-04-14 |

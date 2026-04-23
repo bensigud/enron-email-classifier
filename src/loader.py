@@ -230,35 +230,6 @@ def is_junk_email(subject: str, body: str) -> bool:
     return False
 
 
-def get_executive_addresses(data_path: str) -> set:
-    """
-    Get the set of executive email addresses from the maildir folder names.
-    Each folder in maildir/ is one executive's mailbox (e.g. 'lay-k', 'skilling-j').
-    We convert folder names to the most common email pattern: first.last@enron.com
-    """
-    data_path = Path(data_path)
-    if not data_path.exists():
-        return set()
-
-    folders = [f.name for f in data_path.iterdir() if f.is_dir()]
-
-    # Build possible email patterns from folder names
-    # Folder format is usually "lastname-f" (e.g. "lay-k", "skilling-j")
-    addresses = set()
-    for folder in folders:
-        parts = folder.split("-")
-        if len(parts) >= 2:
-            lastname = parts[0]
-            firstinit = parts[1]
-            # Common Enron patterns
-            addresses.add(f"{firstinit}.{lastname}@enron.com")
-            addresses.add(f"{firstinit}{lastname}@enron.com")
-            addresses.add(f"{lastname}.{firstinit}@enron.com")
-            addresses.add(f"{lastname}{firstinit}@enron.com")
-            addresses.add(f"{firstinit}.{lastname}@enron.com".lower())
-
-    return addresses
-
 
 def get_exec_addresses(data_path: str) -> set:
     """
@@ -285,7 +256,6 @@ def get_exec_addresses(data_path: str) -> set:
                     except Exception:
                         continue
 
-    exec_addresses.update(get_executive_addresses(str(data_path)))
     return exec_addresses
 
 

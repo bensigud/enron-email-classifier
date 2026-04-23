@@ -41,17 +41,6 @@ DEFAULT_CONFIG = {
     "dbscan_min_samples": 5,
 }
 
-FULL_CONFIG = {
-    "batch_strategy": "full",
-    "email_sample_size": 0,        # 0 = all
-    "label_sample_size": 500,
-    "min_emails_per_pair": 5,
-    "k_min": 3,
-    "k_max": 8,
-    "dbscan_eps_values": [0.5, 0.75, 1.0, 1.5, 2.0],
-    "dbscan_min_samples": 5,
-}
-
 
 def _update_progress(stage: str, status: str, detail: str = "",
                      stats: dict = None):

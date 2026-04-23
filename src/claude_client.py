@@ -130,28 +130,6 @@ async def _label_all_async(texts: list) -> list:
     return all_results
 
 
-def label_email(email_text: str) -> dict:
-    """
-    Label a single email (fallback for small batches).
-    Grounded in Reis & Shaver's Interpersonal Process Model of Intimacy (1988).
-    """
-    if not isinstance(email_text, str) or not email_text.strip():
-        return {"intimacy": 1, "warmth": 3}
-
-    results = _parse_batch_response("", 0)
-    texts = [email_text]
-    block = _build_emails_block(texts)
-    prompt = BATCH_PROMPT_TEMPLATE.format(emails_block=block)
-
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=10,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    parsed = _parse_batch_response(response.content[0].text, 1)
-    return parsed[0]
-
 
 def label_email_batch(df: pd.DataFrame,
                       sample_size: int = LABEL_SAMPLE_SIZE) -> pd.DataFrame:
@@ -171,8 +149,8 @@ def label_email_batch(df: pd.DataFrame,
     sample["warmth_label"] = [r["warmth"] for r in results]
 
     print(f"Labeling complete.")
-    print(f"  Intimacy distribution:\n{sample['intimacy_label'].value_counts().sort_index().to_string()}")
-    print(f"  Warmth distribution:\n{sample['warmth_label'].value_counts().sort_index().to_string()}")
+    print(f"  Self-disclosure distribution:\n{sample['intimacy_label'].value_counts().sort_index().to_string()}")
+    print(f"  Responsiveness distribution:\n{sample['warmth_label'].value_counts().sort_index().to_string()}")
 
     return sample
 

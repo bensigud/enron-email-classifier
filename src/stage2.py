@@ -549,7 +549,7 @@ def flag_outlier_relationships(pair_features_df: pd.DataFrame) -> pd.DataFrame:
     flags = [[] for _ in range(len(df))]
 
     # --- Romantic / deeply personal ---
-    # Must be 2+ standard deviations above mean on BOTH scales
+    # Must be 3+ standard deviations above mean on BOTH scales
     if "avg_intimacy" in df.columns and "avg_warmth" in df.columns:
         int_threshold = df["avg_intimacy"].mean() + 3 * df["avg_intimacy"].std()
         warm_threshold = df["avg_warmth"].mean() + 3 * df["avg_warmth"].std()
@@ -558,10 +558,10 @@ def flag_outlier_relationships(pair_features_df: pd.DataFrame) -> pd.DataFrame:
             flags[df.index.get_loc(i)].append("Romantic")
         n = romantic_mask.sum()
         if n > 0:
-            print(f"    Romantic: {n} pairs (high intimacy + high warmth)")
+            print(f"    Romantic: {n} pairs (high disclosure + high responsiveness)")
 
     # --- Hostile / adversarial ---
-    # Very low warmth AND negative sentiment
+    # Very low responsiveness AND negative sentiment
     if "avg_warmth" in df.columns and "avg_sentiment" in df.columns:
         warm_low = df["avg_warmth"].mean() - 3 * df["avg_warmth"].std()
         sent_low = df["avg_sentiment"].mean() - 3 * df["avg_sentiment"].std()
@@ -570,7 +570,7 @@ def flag_outlier_relationships(pair_features_df: pd.DataFrame) -> pd.DataFrame:
             flags[df.index.get_loc(i)].append("Hostile")
         n = hostile_mask.sum()
         if n > 0:
-            print(f"    Hostile: {n} pairs (low warmth + negative sentiment)")
+            print(f"    Hostile: {n} pairs (low responsiveness + negative sentiment)")
 
     # --- After-hours / personal ---
     # High after-hours ratio suggests personal relationship
@@ -594,19 +594,6 @@ def flag_outlier_relationships(pair_features_df: pd.DataFrame) -> pd.DataFrame:
         n = onesided_mask.sum()
         if n > 0:
             print(f"    Hierarchical: {n} pairs (one-sided + high degree difference)")
-
-    # --- High-intensity / crisis ---
-    # Very high email frequency + bursty pattern
-    if "emails_per_month" in df.columns:
-        epm_threshold = df["emails_per_month"].quantile(0.9)
-        intense_mask = df["emails_per_month"] > epm_threshold
-        if "burstiness" in df.columns:
-            intense_mask = intense_mask & (df["burstiness"] > 0.3)
-        for i in df.index[intense_mask]:
-            flags[df.index.get_loc(i)].append("High-intensity")
-        n = intense_mask.sum()
-        if n > 0:
-            print(f"    High-intensity: {n} pairs (top 10% frequency + bursty)")
 
     # Build flags column
     df["flags"] = [", ".join(f) if f else "" for f in flags]

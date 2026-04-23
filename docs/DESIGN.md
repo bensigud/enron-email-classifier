@@ -3,8 +3,8 @@
 
 **Course:** RAF620M — Introduction to Machine Learning and AI
 **Team:** Atli, Benedikt, Hugo
-**Date:** 2026-04-20
-**Status:** v4
+**Date:** 2026-04-23
+**Status:** Final
 
 ---
 
@@ -13,7 +13,7 @@
 This project builds an ML pipeline that classifies the **relationships between people** at Enron based on their email communication. Most Enron projects classify emails (spam, fraud) or analyse the network in isolation. Ours classifies *relationships* — and does so using a theoretically grounded framework with human-in-the-loop validation.
 
 The project has 4 main parts:
-1. **Data pipeline** — load, clean, deduplicate, and filter ~165,000 emails to ~150 executives
+1. **Data pipeline** — load, clean, deduplicate, and filter 174,685 emails down to 46,878 internal executive emails
 2. **ML pipeline** — score emails, build pair features, flag outliers, cluster, interpret
 3. **Human validation** — team members label emails and pairs, measuring agreement with the pipeline
 4. **Interactive UI** — Streamlit app with network graph, validation tools, and Claude chat
@@ -47,17 +47,18 @@ Here is exactly what happens when you run the pipeline:
 
 ### Step 1: Load & Clean Emails (`loader.py`)
 
-**What:** Read ~165,000 raw Enron email files from `data/raw/maildir/`.
+**What:** Read raw Enron email files from `data/raw/maildir/` (151 executive mailboxes).
 
 **How:**
 - Parse each `.txt` file using Python's `email` library (parallelised across all CPU cores)
 - Extract: sender, recipients, CC, date, subject, body
 - **Clean the body:** strip quoted replies (cuts at `--- Original Message ---`, `> ` lines, `On Mon... wrote:` patterns), remove URLs, collapse whitespace. Only the sender's own words are kept.
 - **Filter junk:** remove auto-replies ("out of office"), newsletters ("unsubscribe"), system messages, emails with <30 characters or <30% alphabetic content
-- **Deduplicate:** fingerprint each email by `sender + first recipient + first 100 chars of body`, keep earliest copy. The same email often appears in both sender's and recipient's mailbox.
-- **Filter to executives only:** keep only emails where both sender and at least one recipient have a mailbox in the dataset (~150 executives)
+- **Deduplicate:** fingerprint each email by `sender + subject[:50] + date[:19]`, keep earliest copy. The same email often appears in both sender's "sent" folder and the recipient's inbox.
+- **Identify external contacts:** before filtering, scan all emails for non-@enron.com recipients that executives email frequently (3+ times). These are saved separately and scored with trained models.
+- **Filter to internal emails:** keep only emails where the sender is an executive (has a mailbox in the dataset) and at least one recipient is @enron.com. This captures executive↔executive and executive↔employee communication.
 
-**Result:** ~165,000 clean, deduplicated emails between executives.
+**Result:** 174,685 parsed emails → 46,878 internal executive emails after filtering.
 
 ---
 
@@ -66,9 +67,9 @@ Here is exactly what happens when you run the pipeline:
 **What:** Build a directed graph of who emails whom, compute network metrics per person.
 
 **How:**
-- Each person is a node, each email creates a directed edge
-- Compute per-person: in-degree, out-degree, betweenness centrality, clustering coefficient, PageRank
-- Classify each person into a role:
+- Each person is a node, each email creates a directed edge (weight = email count)
+- Compute per-person: in-degree, out-degree, betweenness centrality (approximated for large graphs, k=200), clustering coefficient, PageRank
+- Classify each executive into a role (non-executives are classified as "Employee"):
 
 | Role | Rule |
 |---|---|
@@ -76,11 +77,12 @@ Here is exactly what happens when you run the pipeline:
 | **Gatekeeper** | Top 15% by betweenness centrality |
 | **Inner Circle** | High clustering coefficient + below-median out-degree |
 | **Isolated** | Bottom 10% by total degree |
-| **Follower** | Everyone else |
+| **Follower** | Everyone else (among executives) |
+| **Employee** | Non-executive @enron.com people |
 
 - Detect communities using greedy modularity (NetworkX)
 
-**Result:** Person features DataFrame + community assignments + network graph.
+**Result:** 7,743 people (183 executives, 7,560 employees), person features DataFrame + community assignments + network graph.
 
 ---
 
@@ -88,13 +90,13 @@ Here is exactly what happens when you run the pipeline:
 
 This is the core ML component. It gives every email three scores.
 
-**The problem:** You have 165,000 emails but you can't read them all. You need a way to automatically score how personal and how warm each email is.
+**The problem:** You have 46,878 emails but you can't read them all. You need a way to automatically score how personal and how warm each email is.
 
 **The solution:** Use Claude to label a sample, then train your own models to score the rest.
 
 #### Step 3a: Claude labels a sample
 
-The Claude API (model: `claude-sonnet-4-6`) reads ~500-2,000 emails and rates each on two scales:
+The Claude API (model: `claude-sonnet-4-6`) reads a batch of emails and rates each on two scales:
 
 - **Self-disclosure** (1-5): How personal is the content?
   - 1 = formal business (reports, contracts)
@@ -106,13 +108,13 @@ The Claude API (model: `claude-sonnet-4-6`) reads ~500-2,000 emails and rates ea
   - 3 = neutral, professional
   - 5 = loving, deeply caring
 
-Emails are sent in batches of 10 per API call with 15 concurrent requests for speed.
+Emails are sent in batches of 10 per API call with 15 concurrent async requests for speed.
 
-Labels are saved to `claude_labeled_emails.csv`. On subsequent runs, cached labels are reused (no repeated API calls).
+Labels are saved to `claude_labeled_emails.csv`. On subsequent runs, cached labels are reused (no repeated API calls). Total labels accumulated: **6,715 emails**.
 
 #### Step 3b: Human labels override Claude
 
-If team members have labeled emails in the validation UI, those labels **override** Claude's labels for the same emails. Skipped/junk emails (labeled 0,0) are excluded from training.
+If team members have labeled emails in the validation UI, those labels **override** Claude's labels for the same emails. Skipped/junk emails (labeled 0,0) are excluded from training. Total human labels: **71 emails**.
 
 #### Step 3c: Train two ML models on the labels
 
@@ -134,6 +136,8 @@ We now have labeled training data (Claude's labels + human corrections). We trai
 - Pick the best model by F1 score
 - Use `predict_proba` to get continuous scores (0.0 to 1.0)
 
+**Current best:** Logistic Regression — F1=0.51, Accuracy=0.84
+
 **Model 2 — Responsiveness (regressor):**
 - Use the raw 1-5 labels directly (no binarization) — because most corporate emails score 3, binary classification would either throw away data or create extreme imbalance
 - Try three regressors:
@@ -150,13 +154,15 @@ We now have labeled training data (Claude's labels + human corrections). We trai
 - Pick the best model by R²
 - Predict 1-5, then normalize to 0.0-1.0
 
+**Current best:** Ridge Regression — R²=0.16, MAE=0.42
+
 **Model 3 — Sentiment (rule-based, no training):**
 - NLTK VADER: a lexicon-based tool that scores emotional tone from -1.0 (very negative) to +1.0 (very positive)
 - Independent from the ML models — provides a backup signal
 
-Both trained models are saved as `.pkl` files so future runs can skip training.
+Both trained models are saved as `.pkl` files so future runs can skip training entirely (predict mode).
 
-#### Step 3d: Score ALL 165,000 emails
+#### Step 3d: Score all emails
 
 Apply the two trained models + VADER to every email:
 
@@ -166,34 +172,34 @@ Apply the two trained models + VADER to every email:
 | `warmth_score` | Responsiveness regressor (predicted 1-5, normalized) | 0.0 – 1.0 |
 | `sentiment_score` | VADER compound score | -1.0 – +1.0 |
 
-**Result:** 165,000 emails, each with 3 scores. No Claude API calls — just your trained models running locally.
+**Result:** 46,878 emails, each with 3 scores. No Claude API calls in predict mode — just your trained models running locally.
 
 ---
 
 ### Step 4: Build Pair Features (`stage2.py`)
 
-**What:** For every pair of executives who exchanged ≥5 emails, aggregate their email scores into a feature vector.
+**What:** For every pair of people who exchanged ≥5 emails (both directions required), aggregate their email scores into a feature vector.
 
 **How:** For each pair (e.g. Ken Lay ↔ Jeff Skilling), look at ALL their emails in both directions and compute **24 features**:
 
 | # | Feature | Category | Source |
 |---|---|---|---|
 | 1 | `avg_intimacy` | Self-disclosure | Mean of intimacy_score across all their emails |
-| 2 | `intimacy_imbalance` | Self-disclosure | abs(A→B intimacy - B→A intimacy) |
-| 3 | `intimacy_std` | Self-disclosure | Volatility of intimacy over time |
+| 2 | `intimacy_imbalance` | Self-disclosure | abs(A→B score - B→A score) |
+| 3 | `intimacy_std` | Self-disclosure | Volatility of self-disclosure over time |
 | 4 | `avg_warmth` | Responsiveness | Mean of warmth_score |
-| 5 | `warmth_imbalance` | Responsiveness | abs(A→B warmth - B→A warmth) |
-| 6 | `warmth_std` | Responsiveness | Volatility of warmth over time |
+| 5 | `warmth_imbalance` | Responsiveness | abs(A→B score - B→A score) |
+| 6 | `warmth_std` | Responsiveness | Volatility of responsiveness over time |
 | 7 | `avg_sentiment` | Sentiment | Mean VADER score |
 | 8 | `sentiment_std` | Sentiment | Volatility of sentiment |
-| 9 | `email_count` | Intensity | Total emails between them |
+| 9 | `email_count` | Intensity | Log-transformed total emails between them |
 | 10 | `direction_ratio` | Intensity | 0.5=balanced, 1.0=one-sided |
 | 11 | `after_hours_ratio` | Intensity | Fraction sent evenings/weekends (before 7am, after 7pm, or weekends) |
 | 12 | `direct_ratio` | Intensity | Fraction sent directly (TO:) vs CC'd |
 | 13 | `burstiness` | Temporal (Ureña-Carrion) | -1=perfectly regular, +1=very bursty |
 | 14 | `inter_event_regularity` | Temporal (Ureña-Carrion) | 0=irregular, 1=clockwork |
 | 15 | `temporal_stability` | Temporal (Ureña-Carrion) | Fraction of months with at least 1 email |
-| 16 | `time_span_days` | Duration | Days between first and last email |
+| 16 | `time_span_days` | Duration | Log-transformed days between first and last email |
 | 17 | `same_community` | Structural | 1 if in same network community, 0 otherwise |
 | 18 | `shared_neighbors` | Structural | Number of people both A and B email |
 | 19 | `dispersion` | Structural (Backstrom) | How spread out their mutual friends are (0=clustered, 1=dispersed) |
@@ -203,7 +209,7 @@ Apply the two trained models + VADER to every email:
 | 23 | `formality_diff` | Style matching (Ireland) | Greeting formality difference |
 | 24 | `pronoun_rate_diff` | Style matching (Ireland) | Difference in pronoun usage |
 
-**Result:** ~355 pairs (with current data), each described by 24 features.
+**Result:** 361 pairs, each described by 24 features.
 
 ---
 
@@ -215,11 +221,10 @@ Apply the two trained models + VADER to every email:
 
 | Flag | Rule | What it catches |
 |---|---|---|
-| **Romantic** | avg_intimacy > 0.75 AND avg_warmth > 0.75 | Deeply personal + warm |
-| **Hostile** | avg_warmth < 0.25 AND avg_sentiment < -0.15 | Cold + negative tone |
+| **Romantic** | avg_intimacy > mean + 3σ AND avg_warmth > mean + 3σ | Deeply personal + responsive |
+| **Hostile** | avg_warmth < mean - 3σ AND avg_sentiment < mean - 3σ | Cold + negative tone |
 | **After-hours** | after_hours_ratio > 0.40 | Evenings/weekends contact |
 | **Hierarchical** | direction_ratio > 0.85 or < 0.15 AND degree_difference > 75th percentile | Boss/subordinate |
-| **High-intensity** | emails_per_month > 90th percentile AND burstiness > 0.3 | Crisis or very active |
 
 Flags are **additive** (a pair can be "Romantic + After-hours") and **independent from clusters** (a pair still gets clustered, but the flag is preserved).
 
@@ -235,7 +240,7 @@ Flags are **additive** (a pair can be "Romantic + After-hours") and **independen
 - Try K = 3, 4, 5, 6, 7 components
 - `GaussianMixture(n_components=K, n_init=5, covariance_type="full")`
 - **Produces soft labels**: each pair gets a probability per cluster (e.g. 70% Business, 25% Mentorship)
-- Evaluated by silhouette score
+- Best K is selected by **BIC** (Bayesian Information Criterion — lower is better), which balances fit quality with model complexity
 
 **Method 2 — K-Means — for comparison:**
 - Same K range
@@ -258,6 +263,8 @@ Flags are **additive** (a pair can be "Romantic + After-hours") and **independen
 
 All features are standardised with `StandardScaler` before clustering.
 
+**Current result:** 5 clusters discovered via GMM.
+
 ---
 
 ### Step 7: Name Clusters (`stage4.py`)
@@ -272,13 +279,13 @@ All features are standardised with `StandardScaler` before clustering.
 
 | Type | What it looks like |
 |---|---|
-| **Transactional** | Low disclosure, low warmth, neutral, surface-level |
-| **Friendly Colleagues** | Moderate warmth, work content, balanced, regular |
-| **Close** | High disclosure + warmth + stability, real trust |
+| **Transactional** | Low disclosure, low responsiveness, neutral, surface-level |
+| **Friendly Colleagues** | Moderate responsiveness, work content, balanced, regular |
+| **Close** | High disclosure + responsiveness + stability, real trust |
 | **Boss-Employee** | High degree difference, skewed direction, low disclosure |
-| **Mentor** | High degree difference + high warmth imbalance (senior is warmer) |
-| **Romance** | Highest disclosure + warmth + after-hours, personal language |
-| **Tense/Conflict** | Low warmth, negative sentiment, volatile |
+| **Mentor** | High degree difference + high responsiveness imbalance (senior is more responsive) |
+| **Romance** | Highest disclosure + responsiveness + after-hours, personal language |
+| **Tense/Conflict** | Low responsiveness, negative sentiment, volatile |
 | **Fading** | Low temporal stability, high burstiness, was active then went silent |
 
 5. Cluster names can be **edited by team members** in the Streamlit UI after Claude's initial suggestion
@@ -287,24 +294,37 @@ All features are standardised with `StandardScaler` before clustering.
 
 ---
 
-## 4. Human-in-the-Loop Validation
+## 4. External Contacts (`main.py`)
+
+Before filtering to internal emails, the pipeline identifies **external contacts** — non-@enron.com addresses that executives email frequently (3+ emails).
+
+- Scores their emails using the trained self-disclosure and responsiveness models
+- Classifies each external contact relationship using z-scores on both scales:
+  - Romantic (3σ+ on both), Close Personal (2σ+), Friendly (1σ+), Distant (below -1σ warmth), Business (default)
+- Saved as `external_contacts.csv` and displayed on the network graph as diamond-shaped nodes
+
+---
+
+## 5. Human-in-the-Loop Validation
 
 The Streamlit app includes a **Human Validation** page with four tabs:
 
 ### Tab 1: Email Labels
-- Team members rate emails on the same intimacy/warmth scales as Claude
+- Team members rate emails on the same self-disclosure/responsiveness scales as Claude
+- **Active learning:** the most uncertain emails (closest to the classifier's decision boundary) are shown first
 - Labels are **blind** — Claude's answer is revealed after submission
 - Cohen's kappa measures agreement between human and Claude
 - Human labels **override Claude's** when retraining the models
 
 ### Tab 2: Relationship Review
 - Team members read emails between a pair and label the relationship type
+- **Active learning:** pairs with the lowest GMM primary probability (most uncertain cluster assignment) are shown first
 - Can select **multiple types** (checkboxes, not single-select)
 - Compares human labels to pipeline's cluster assignment
 
 ### Tab 3: Cluster Name Editor
 - Shows each cluster's profile (z-score bars, key stats, top pairs)
-- Team can **rename** clusters directly — saved to `cluster_names.json`
+- Team can **rename** clusters directly — saved to `cluster_names.json` and propagated to `relationship_pairs.csv`
 
 ### Tab 4: Results Dashboard
 - Cohen's kappa per annotator (human vs Claude, human vs human)
@@ -313,11 +333,11 @@ The Streamlit app includes a **Human Validation** page with four tabs:
 
 ---
 
-## 5. Project Structure
+## 6. Project Structure
 
 ```
 Enron Project/
-├── app.py                  # Streamlit UI
+├── app.py                  # Streamlit UI (3,300 lines)
 ├── main.py                 # Pipeline orchestrator
 ├── requirements.txt
 │
@@ -331,25 +351,24 @@ Enron Project/
 │   └── claude_client.py    # Claude API (labeling + chat)
 │
 ├── data/
-│   ├── raw/maildir/        # Raw Enron emails
+│   ├── raw/maildir/        # Raw Enron emails (151 mailboxes)
 │   ├── processed/          # Cleaned emails (.parquet)
 │   └── results/            # All outputs (models, CSVs, plots)
 │
 └── docs/
-    ├── PRD.md
-    ├── DESIGN.md
-    └── REPORT.md
+    ├── PRD.md              # Product requirements
+    └── DESIGN.md           # This document
 ```
 
 ---
 
-## 6. Models & Technologies
+## 7. Models & Technologies
 
 | Component | Technology | Purpose |
 |---|---|---|
 | Email labeling | Claude API (`claude-sonnet-4-6`) | Rate emails on two scales |
-| Self-disclosure classifier | Logistic Regression / SVM / Random Forest | Predict intimacy from email text |
-| Responsiveness regressor | Ridge / SVR / Random Forest Regressor | Predict warmth from email text |
+| Self-disclosure classifier | Logistic Regression / SVM / Random Forest | Predict self-disclosure from email text |
+| Responsiveness regressor | Ridge / SVR / Random Forest Regressor | Predict responsiveness from email text |
 | Text features | TF-IDF (max 5000 features, bigrams) | Convert email text to numbers |
 | Sentiment | NLTK VADER | Rule-based emotional tone |
 | Network analysis | NetworkX | Graph metrics, communities |
@@ -359,30 +378,34 @@ Enron Project/
 
 ---
 
-## 7. Evaluation Strategy
+## 8. Evaluation Strategy
 
 | What we evaluate | How | Metric |
 |---|---|---|
-| Self-disclosure classifier | 5-fold CV on labeled data | F1 score (best model) |
-| Responsiveness regressor | 5-fold CV on labeled data | R² score (best model) |
-| Model selection significance | Paired t-test between top 2 models | p-value < 0.05 |
+| Self-disclosure classifier | 5-fold CV on labeled data | F1=0.51, Accuracy=0.84 |
+| Responsiveness regressor | 5-fold CV on labeled data | R²=0.16, MAE=0.42 |
+| Model selection significance | Paired t-test between top 2 models | p-value (not significant for either) |
 | Claude label quality | Human labels vs Claude labels | Cohen's kappa |
 | Inter-human agreement | Compare team members' labels | Cohen's kappa |
 | Clustering quality | Compare GMM vs K-Means vs DBSCAN | Silhouette, Davies-Bouldin, Calinski-Harabasz |
+| Full model vs baselines | Ablation study removing one paper's features at a time | Silhouette drop |
 | Pipeline accuracy | Human relationship labels vs cluster assignment | % match |
 | Cluster names | Team votes in UI | Agreement rate |
 
 ---
 
-## 8. How to Run
+## 9. How to Run
 
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 
-# Download Enron data to data/raw/maildir/
+# Download NLTK data (first time only)
+python -c "import nltk; nltk.download('vader_lexicon')"
 
-# Run the pipeline (sample mode — labels 500 emails with Claude)
+# Place the Enron maildir dataset at data/raw/maildir/
+
+# Run the pipeline (sample mode — labels ~2,000 emails with Claude)
 python main.py
 
 # Or run with a config file (generated by the UI)
@@ -392,7 +415,7 @@ python main.py --config data/results/pipeline_config.json
 streamlit run app.py
 ```
 
-**Pipeline modes:**
-- **Sample:** Process 2,000 emails, label 500 with Claude, train models (~5 min)
-- **Full:** Process all emails, label 500 with Claude, train models (~30 min)
-- **Retrain:** Process all emails, use cached labels, retrain models (no Claude calls, ~1 min)
+**Pipeline modes (controlled from the Training page in the UI):**
+- **Sample:** Process a batch of 2,000 emails, label them with Claude, train models (~5 min)
+- **Retrain:** Retrain models on all existing labels (including human corrections), score all emails, rebuild pairs/clusters — no Claude calls (~2 min)
+- **Full (Predict):** Load saved models, score all 46,878 emails, build pairs, cluster, and name — no Claude calls, no training (~3 min)

@@ -114,14 +114,6 @@ def load_clustering_meta():
         return json.load(f)
 
 
-@st.cache_data
-def load_model_comparison():
-    path = RESULTS_PATH / "model_comparison.json"
-    if not path.exists():
-        return {}
-    with open(path) as f:
-        return json.load(f)
-
 
 @st.cache_data
 def load_communities():
@@ -528,8 +520,8 @@ def build_interactive_network(person_df, pairs_df, cluster_names_dict,
                     f"Type: <b>{rel_type}</b><br>"
                     f"Domain: {domain}<br>"
                     f"Emails: {count}<br>"
-                    f"Intimacy: {intimacy:.2f}<br>"
-                    f"Warmth: {warmth:.2f}"
+                    f"Self-disclosure: {intimacy:.2f}<br>"
+                    f"Responsiveness: {warmth:.2f}"
                 ),
                 color={
                     "background": node_color,
@@ -685,7 +677,6 @@ person_df = load_person_data()
 pairs_df = load_relationship_data()
 cluster_profiles = load_cluster_profiles()
 clustering_meta = load_clustering_meta()
-model_comparison = load_model_comparison()
 cluster_names = load_cluster_names()
 
 data_ready = person_df is not None
@@ -1414,8 +1405,6 @@ elif page == "🏠 Overview":
             for i, (label, safe_name) in enumerate(cm_models):
                 cm_path = RESULTS_PATH / f"confusion_matrix_intimacy_{safe_name}.png"
                 # Fallback to old single-model file
-                if not cm_path.exists() and i == 0:
-                    cm_path = RESULTS_PATH / "confusion_matrix_intimacy.png"
                 if cm_path.exists():
                     cm_cols[i].markdown(f"**{label}**")
                     cm_cols[i].image(str(cm_path), width='stretch')

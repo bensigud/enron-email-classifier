@@ -110,8 +110,8 @@ Average feature values:
     avg_sentiment: {profile.get('avg_sentiment', 0):.3f}  (-1=very negative, +1=very positive, VADER)
     intimacy_imbalance: {profile.get('intimacy_imbalance', 0):.3f}  (0=mutual disclosure, high=one-sided)
     warmth_imbalance: {profile.get('warmth_imbalance', 0):.3f}  (0=mutual responsiveness, high=one-sided)
-    intimacy_std: {profile.get('intimacy_std', 0):.3f}  (volatility of intimacy over time)
-    warmth_std: {profile.get('warmth_std', 0):.3f}  (volatility of warmth over time)
+    intimacy_std: {profile.get('intimacy_std', 0):.3f}  (volatility of self-disclosure over time)
+    warmth_std: {profile.get('warmth_std', 0):.3f}  (volatility of responsiveness over time)
     email_count: {profile.get('email_count', 0):.1f}  (average emails between pairs)
     time_span_days: {profile.get('time_span_days', 0):.0f}  (days between first and last email)
     direction_ratio: {profile.get('direction_ratio', 0):.3f}  (0.5=balanced, 1=one-way)
@@ -147,12 +147,12 @@ These types are adapted from Kram & Isabella's (1985) workplace peer typology
 and Sias & Cahill (1998):
 
 1. Transactional — surface-level info exchange, low disclosure, low warmth, neutral
-2. Friendly Colleagues — moderate warmth, mostly work content, balanced, regular contact
-3. Close — high disclosure + warmth + stability, real trust, personal sharing
+2. Friendly Colleagues — moderate responsiveness, mostly work content, balanced, regular contact
+3. Close — high disclosure + responsiveness + stability, real trust, personal sharing
 4. Boss-Employee — high degree_difference, skewed direction, low disclosure, top-down
-5. Mentor — high degree_difference + high warmth_imbalance (senior is warmer), supportive
-6. Romance — highest disclosure + warmth + after_hours_ratio, personal/emotional language
-7. Tense / Conflict — low warmth, negative sentiment, volatile, friction
+5. Mentor — high degree_difference + high warmth_imbalance (senior is more responsive), supportive
+6. Romance — highest disclosure + responsiveness + after_hours_ratio, personal/emotional language
+7. Tense / Conflict — low responsiveness, negative sentiment, volatile, friction
 8. Fading — low temporal_stability, high burstiness, was active then went silent
 
 Rules:

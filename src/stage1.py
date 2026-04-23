@@ -52,6 +52,12 @@ from src.claude_client import (
     load_labeled_sample,
 )
 
+# Display names for user-facing text (filenames keep the short names)
+DISPLAY_NAMES = {
+    "intimacy": "Self-Disclosure",
+    "warmth": "Responsiveness",
+}
+
 
 def score_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -63,8 +69,8 @@ def score_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     common phrases.
 
     This measures TONE (positive/negative), which is independent from
-    the warmth_score that measures supportiveness, and from the
-    intimacy_score that measures personal content.
+    the warmth_score (responsiveness) that measures supportiveness, and from
+    the intimacy_score (self-disclosure) that measures personal content.
     """
     print("  Scoring sentiment with VADER...")
     analyzer = SentimentIntensityAnalyzer()
@@ -91,13 +97,14 @@ def train_classifier(labeled_df: pd.DataFrame, scale_name: str,
                      label_col: str, low_range: list, high_range: list,
                      output_dir: str) -> dict:
     """
-    Train a binary classifier for one scale (intimacy or warmth).
+    Train a binary classifier for one scale (self-disclosure or responsiveness).
 
     Converts 1-5 labels to binary using the provided ranges, then
     trains LogReg, SVM, RF with 5-fold CV. Uses predict_proba to
     get continuous scores (0.0 to 1.0).
     """
-    print(f"  Training {scale_name} classifier...")
+    display_name = DISPLAY_NAMES.get(scale_name, scale_name)
+    print(f"  Training {display_name} classifier...")
 
     df = labeled_df.copy()
 
@@ -115,7 +122,7 @@ def train_classifier(labeled_df: pd.DataFrame, scale_name: str,
     print(f"    Samples: {len(df)} ({n_high} high, {n_low} low)")
 
     if len(df) < 20 or y.nunique() < 2:
-        print(f"    WARNING: Not enough samples for {scale_name}. Skipping.")
+        print(f"    WARNING: Not enough samples for {display_name}. Skipping.")
         return None
 
     def _make_models():
@@ -199,14 +206,14 @@ def train_classifier(labeled_df: pd.DataFrame, scale_name: str,
         y_pred = eval_pipeline.predict(X_test)
 
         if model_name == best_name:
-            print(f"\n    {scale_name} classification report ({model_name}):")
+            print(f"\n    {display_name} classification report ({model_name}):")
             print(classification_report(y_test, y_pred, zero_division=0))
 
         # Save confusion matrix for each model
         safe_name = model_name.lower().replace(" ", "_")
         _plot_confusion_matrix(
             y_test, y_pred,
-            f"{scale_name} — {model_name}",
+            f"{display_name} — {model_name}",
             output_dir,
             f"{scale_name}_{safe_name}",
         )
@@ -259,13 +266,14 @@ def classify_all_emails(df: pd.DataFrame, pipeline, score_col: str) -> pd.DataFr
 def train_regressor(labeled_df: pd.DataFrame, scale_name: str,
                     label_col: str, output_dir: str) -> dict:
     """
-    Train a regressor for one scale (warmth).
+    Train a regressor for one scale (responsiveness).
 
     Uses the raw 1-5 labels directly — no binarization needed.
     Trains Ridge, SVR, RF Regressor with 5-fold CV.
     Output is normalized to 0.0-1.0.
     """
-    print(f"  Training {scale_name} regressor...")
+    display_name = DISPLAY_NAMES.get(scale_name, scale_name)
+    print(f"  Training {display_name} regressor...")
 
     df = labeled_df.copy()
     df = df[df[label_col].notna()].copy()
@@ -277,7 +285,7 @@ def train_regressor(labeled_df: pd.DataFrame, scale_name: str,
     print(f"    Label distribution:\n{y.value_counts().sort_index().to_string()}")
 
     if len(df) < 20:
-        print(f"    WARNING: Not enough samples for {scale_name}. Skipping.")
+        print(f"    WARNING: Not enough samples for {display_name}. Skipping.")
         return None
 
     def _make_models():
@@ -357,10 +365,10 @@ def train_regressor(labeled_df: pd.DataFrame, scale_name: str,
 
     r2 = r2_score(y_test, y_pred)
     mae = mean_absolute_error(y_test, y_pred)
-    print(f"\n    {scale_name} test set ({best_name}): R²={r2:.3f}, MAE={mae:.3f}")
+    print(f"\n    {display_name} test set ({best_name}): R²={r2:.3f}, MAE={mae:.3f}")
 
     _plot_regression_scatter(y_test, y_pred,
-                             f"{scale_name} — {best_name}", output_dir, scale_name)
+                             f"{display_name} — {best_name}", output_dir, scale_name)
 
     # Retrain on ALL data for production
     models3 = _make_models()
@@ -447,7 +455,7 @@ def _plot_confusion_matrix(y_true, y_pred, title, output_dir, scale_name):
 def _plot_model_comparison(all_results: dict, output_dir: str):
     """
     Plot model comparison for both scales.
-    Handles both classification metrics (intimacy) and regression metrics (warmth).
+    Handles both classification metrics (self-disclosure) and regression metrics (responsiveness).
     """
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -505,11 +513,11 @@ def _save_models(intimacy_result, warmth_result, output_dir):
     if intimacy_result:
         with open(out / "model_intimacy.pkl", "wb") as f:
             pickle.dump(intimacy_result["pipeline"], f)
-        print(f"    Saved intimacy model: {intimacy_result['best_model']}")
+        print(f"    Saved self-disclosure model: {intimacy_result['best_model']}")
     if warmth_result:
         with open(out / "model_warmth.pkl", "wb") as f:
             pickle.dump(warmth_result["pipeline"], f)
-        print(f"    Saved warmth model: {warmth_result['best_model']}")
+        print(f"    Saved responsiveness model: {warmth_result['best_model']}")
 
 
 def _load_models(output_dir):
@@ -525,11 +533,11 @@ def _load_models(output_dir):
     if intimacy_path.exists():
         with open(intimacy_path, "rb") as f:
             intimacy_pipeline = pickle.load(f)
-        print(f"    Loaded intimacy model from disk")
+        print(f"    Loaded self-disclosure model from disk")
     if warmth_path.exists():
         with open(warmth_path, "rb") as f:
             warmth_pipeline = pickle.load(f)
-        print(f"    Loaded warmth model from disk")
+        print(f"    Loaded responsiveness model from disk")
 
     return intimacy_pipeline, warmth_pipeline
 
@@ -647,17 +655,17 @@ def run_stage1(df: pd.DataFrame, output_dir: str = "data/results",
     corr_sent_int = df["intimacy_score"].corr(df["sentiment_score"])
     corr_sent_warm = df["warmth_score"].corr(df["sentiment_score"])
     print(f"\n  Score correlations:")
-    print(f"    intimacy ↔ warmth:    r={corr:.3f}")
-    print(f"    intimacy ↔ sentiment: r={corr_sent_int:.3f}")
-    print(f"    warmth   ↔ sentiment: r={corr_sent_warm:.3f}")
+    print(f"    disclosure ↔ responsiveness: r={corr:.3f}")
+    print(f"    disclosure ↔ sentiment:      r={corr_sent_int:.3f}")
+    print(f"    responsiveness ↔ sentiment:  r={corr_sent_warm:.3f}")
 
     # Step 7 — Plot comparison
     _plot_model_comparison({
-        "intimacy": {
+        "self-disclosure": {
             "results": intimacy_result["results"] if intimacy_result else None,
             "mode": "classification",
         },
-        "warmth": {
+        "responsiveness": {
             "results": warmth_result["results"] if warmth_result else None,
             "mode": "regression",
         },
@@ -669,9 +677,9 @@ def run_stage1(df: pd.DataFrame, output_dir: str = "data/results",
 
     print(f"\n  Stage 1 complete (train mode).")
     if intimacy_result:
-        print(f"    Intimacy: {intimacy_result['best_model']} (classifier)")
+        print(f"    Self-disclosure: {intimacy_result['best_model']} (classifier)")
     if warmth_result:
-        print(f"    Warmth: {warmth_result['best_model']} (regressor)")
+        print(f"    Responsiveness: {warmth_result['best_model']} (regressor)")
     print(f"    Sentiment: VADER (rule-based)")
 
     return df
