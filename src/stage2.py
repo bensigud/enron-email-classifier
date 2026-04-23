@@ -39,89 +39,98 @@ from pathlib import Path
 MIN_EMAILS_PER_PAIR = 5
 
 
-def _compute_text_style(texts: list) -> dict:
+# Function word categories from Ireland et al. (2011)
+# "Language style matching predicts relationship initiation and stability"
+# These are the 9 categories used in the LSM formula.
+_LSM_CATEGORIES = {
+    "pronouns": {"i", "me", "my", "mine", "myself", "you", "your", "yours",
+                 "he", "she", "him", "her", "his", "hers", "we", "us", "our",
+                 "ours", "they", "them", "their", "theirs", "it", "its"},
+    "articles": {"a", "an", "the"},
+    "prepositions": {"in", "on", "at", "to", "for", "from", "by", "with",
+                     "about", "into", "through", "during", "before", "after",
+                     "above", "below", "between", "under", "over", "of"},
+    "auxiliary_verbs": {"is", "am", "are", "was", "were", "be", "been", "being",
+                        "have", "has", "had", "do", "does", "did", "will",
+                        "would", "could", "should", "may", "might", "shall",
+                        "can", "must"},
+    "negations": {"no", "not", "never", "neither", "nobody", "nothing",
+                  "nowhere", "nor", "don't", "doesn't", "didn't", "won't",
+                  "wouldn't", "couldn't", "shouldn't", "can't", "isn't",
+                  "aren't", "wasn't", "weren't", "hasn't", "haven't"},
+    "conjunctions": {"and", "but", "or", "so", "yet", "because", "although",
+                     "while", "if", "when", "since", "unless", "however",
+                     "therefore", "though"},
+    "quantifiers": {"all", "each", "every", "many", "much", "few", "several",
+                    "some", "any", "most", "more", "less", "enough", "both"},
+    "adverbs": {"very", "really", "just", "also", "too", "always", "never",
+                "often", "sometimes", "usually", "already", "still", "even",
+                "only", "quite", "rather", "almost", "probably", "actually"},
+}
+
+# Casual/formal greetings for formality feature
+_CASUAL_GREETINGS = {"hey", "hi", "hiya", "yo", "sup"}
+_FORMAL_GREETINGS = {"dear", "greetings", "good morning", "good afternoon"}
+
+
+def _compute_function_word_rates(texts: list) -> dict:
     """
-    Compute writing style metrics from a list of email texts.
-    Returns averages across all texts for this person's direction.
+    Compute function word rates per category from Ireland et al. (2011).
+    Returns rate (0-1) for each of the 9 LSM categories + formality.
     """
     if not texts:
-        return {
-            "avg_word_len": 0, "avg_sent_len": 0, "pronoun_rate": 0,
-            "question_rate": 0, "exclamation_rate": 0, "greeting_formality": 0,
-        }
+        return {cat: 0.0 for cat in _LSM_CATEGORIES} | {"formality": 0.0}
 
-    PRONOUNS = {"i", "me", "my", "mine", "myself", "you", "your", "yours",
-                "we", "us", "our", "ours", "he", "she", "him", "her", "they", "them"}
-    CASUAL_GREETINGS = {"hey", "hi", "hiya", "yo", "sup"}
-    FORMAL_GREETINGS = {"dear", "greetings", "good morning", "good afternoon"}
-
-    word_lens = []
-    sent_lens = []
-    pronoun_rates = []
-    question_rates = []
-    exclamation_rates = []
+    category_counts = {cat: 0 for cat in _LSM_CATEGORIES}
+    total_words = 0
     formality_scores = []
 
     for text in texts:
         if not isinstance(text, str) or len(text.strip()) < 5:
             continue
 
-        words = text.lower().split()
+        words = re.findall(r"[a-z']+", text.lower())
         if not words:
             continue
 
-        # Average word length
-        word_lens.append(np.mean([len(w) for w in words]))
+        total_words += len(words)
+        for cat, word_set in _LSM_CATEGORIES.items():
+            category_counts[cat] += sum(1 for w in words if w in word_set)
 
-        # Average sentence length (words per sentence)
-        sentences = re.split(r'[.!?]+', text)
-        sentences = [s.strip() for s in sentences if s.strip()]
-        if sentences:
-            sent_lens.append(np.mean([len(s.split()) for s in sentences]))
-
-        # Pronoun rate
-        n_pronouns = sum(1 for w in words if w in PRONOUNS)
-        pronoun_rates.append(n_pronouns / len(words))
-
-        # Question rate (questions per sentence)
-        n_questions = text.count("?")
-        n_sents = max(len(sentences), 1)
-        question_rates.append(n_questions / n_sents)
-
-        # Exclamation rate
-        n_excl = text.count("!")
-        exclamation_rates.append(n_excl / n_sents)
-
-        # Greeting formality: -1=casual, 0=none, +1=formal
+        # Greeting formality
         first_line = text.strip().split("\n")[0].lower().strip()
-        if any(g in first_line for g in CASUAL_GREETINGS):
+        if any(g in first_line for g in _CASUAL_GREETINGS):
             formality_scores.append(-1)
-        elif any(g in first_line for g in FORMAL_GREETINGS):
+        elif any(g in first_line for g in _FORMAL_GREETINGS):
             formality_scores.append(1)
         else:
             formality_scores.append(0)
 
-    def _safe_mean(lst):
-        return np.mean(lst) if lst else 0.0
+    if total_words == 0:
+        return {cat: 0.0 for cat in _LSM_CATEGORIES} | {"formality": 0.0}
 
-    return {
-        "avg_word_len": _safe_mean(word_lens),
-        "avg_sent_len": _safe_mean(sent_lens),
-        "pronoun_rate": _safe_mean(pronoun_rates),
-        "question_rate": _safe_mean(question_rates),
-        "exclamation_rate": _safe_mean(exclamation_rates),
-        "greeting_formality": _safe_mean(formality_scores),
-    }
+    rates = {cat: count / total_words for cat, count in category_counts.items()}
+    rates["formality"] = np.mean(formality_scores) if formality_scores else 0.0
+    return rates
+
+
+def _lsm_score(rate_a: float, rate_b: float) -> float:
+    """
+    LSM formula from Ireland et al. (2011):
+    LSM_category = 1 - (|rate_A - rate_B| / (rate_A + rate_B + 0.0001))
+
+    Returns 0-1 where 1 = identical usage, 0 = completely different.
+    """
+    return 1 - (abs(rate_a - rate_b) / (rate_a + rate_b + 0.0001))
 
 
 def _compute_style_matching(df: pd.DataFrame, pairs_df: pd.DataFrame) -> pd.DataFrame:
     """
-    For each pair, compute how similarly A and B write to each other.
-    Lower difference = higher style matching = closer relationship.
-
-    Based on Ireland et al. (2011) linguistic style matching.
+    Compute linguistic style matching (LSM) for each pair using the
+    method from Ireland et al. (2011). Compares function word usage
+    rates across 9 categories and averages into an overall LSM score.
     """
-    print("  Computing language style matching features...")
+    print("  Computing language style matching (Ireland et al. 2011)...")
 
     # Group all email texts by (sender, recipient)
     texts_by_direction = {}
@@ -140,40 +149,38 @@ def _compute_style_matching(df: pd.DataFrame, pairs_df: pd.DataFrame) -> pd.Data
     for _, pair_row in pairs_df.iterrows():
         a, b = pair_row["person_a"], pair_row["person_b"]
 
-        # Get texts A→B and B→A
         texts_a_to_b = texts_by_direction.get((a, b), [])
         texts_b_to_a = texts_by_direction.get((b, a), [])
 
-        style_a = _compute_text_style(texts_a_to_b)
-        style_b = _compute_text_style(texts_b_to_a)
+        rates_a = _compute_function_word_rates(texts_a_to_b)
+        rates_b = _compute_function_word_rates(texts_b_to_a)
 
-        # Style matching = 1 - normalized absolute difference per metric
-        # Lower difference = higher matching
-        metrics = ["avg_word_len", "avg_sent_len", "pronoun_rate",
-                   "question_rate", "exclamation_rate"]
+        # LSM per category, then average (Ireland et al. 2011 formula)
+        category_lsm = []
+        for cat in _LSM_CATEGORIES:
+            lsm = _lsm_score(rates_a[cat], rates_b[cat])
+            category_lsm.append(lsm)
 
-        diffs = []
-        for m in metrics:
-            max_val = max(abs(style_a[m]), abs(style_b[m]), 0.001)
-            diff = abs(style_a[m] - style_b[m]) / max_val
-            diffs.append(min(diff, 1.0))  # cap at 1
+        # Overall LSM: average across all 9 categories
+        style_similarity = np.mean(category_lsm)
 
-        # Overall style similarity: 1 = identical style, 0 = completely different
-        style_similarity = 1 - np.mean(diffs)
+        # Formality difference (kept as additional feature)
+        formality_diff = abs(rates_a["formality"] - rates_b["formality"])
 
-        # Greeting formality difference (do they greet each other the same way?)
-        formality_diff = abs(style_a["greeting_formality"] - style_b["greeting_formality"])
+        # Pronoun rate difference (most predictive single category)
+        pronoun_rate_diff = abs(rates_a["pronouns"] - rates_b["pronouns"])
 
         style_features.append({
             "person_a": a,
             "person_b": b,
             "style_similarity": round(style_similarity, 4),
             "formality_diff": round(formality_diff, 4),
-            "pronoun_rate_diff": round(abs(style_a["pronoun_rate"] - style_b["pronoun_rate"]), 4),
+            "pronoun_rate_diff": round(pronoun_rate_diff, 4),
         })
 
     result = pd.DataFrame(style_features)
-    print(f"    Style matching: mean similarity = {result['style_similarity'].mean():.3f}")
+    print(f"    LSM: mean={result['style_similarity'].mean():.3f} "
+          f"(9 function word categories)")
     return result
 
 
